@@ -1,0 +1,10 @@
+# Sample scaffold.toml — drop-in additions once you've run `logos-scaffold basecamp setup`,
+# which will have generated a scaffold.toml in this directory with the [scaffold], [framework],
+# [basecamp] and related sections. Append the block below so `basecamp modules` can resolve
+# every runtime dep Yolo declares.
+
+[basecamp.dependencies]
+storage_module                 = "github:logos-co/logos-storage-module#lgx"
+liblogos_zone_sequencer_module = "github:jimmy-claw/logos-zone-sequencer-module#lgx"
+# delivery_module is already in scaffold's defaults; listed here only to override the pin.
+# delivery_module              = "github:logos-co/logos-delivery-module/1.1.0#lgx"
