@@ -12,15 +12,13 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.logos-cpp-sdk.follows = "logos-cpp-sdk";
     };
-    logos-storage-module = {
-      # Points at our fork until the storage-nim narHash drift is fixed
-      # upstream (open PR: vpavlin/logos-storage-module branch
-      # fix/storage-nim-narhash-drift). Only the flake.lock narHash of
-      # the transitive logos-storage-nim submodule-bearing git input is
-      # relocked to the currently-reproducible value; no source changes.
-      url = "github:vpavlin/logos-storage-module/fix/storage-nim-narhash-drift";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    # Note: no logos-storage-module flake input. Storage's generated client
+    # headers (storage_module_api.{h,cpp}) are vendored under
+    # module/vendor/storage_module_api/. Pulling the full flake transitively
+    # requires a git+https?submodules=1 fetch of logos-storage-nim whose
+    # NAR hash is not reproducible across environments, which broke CI.
+    # The storage_module .lgx is installed into basecamp profiles by
+    # scaffold at deploy time — nothing in this flake needs to build it.
     logos-delivery-module = {
       url = "github:logos-co/logos-delivery-module/1.1.0";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -30,20 +28,19 @@
     };
   };
 
-  outputs = { self, nixpkgs, logos-cpp-sdk, logos-liblogos, logos-storage-module, logos-delivery-module, logos-package, ... }:
+  outputs = { self, nixpkgs, logos-cpp-sdk, logos-liblogos, logos-delivery-module, logos-package, ... }:
     let
       systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f {
         pkgs = import nixpkgs { inherit system; };
         logosSdk = logos-cpp-sdk.packages.${system}.default;
         logosLiblogos = logos-liblogos.packages.${system}.default;
-        logosStorage = logos-storage-module.packages.${system}.default;
         logosDelivery = logos-delivery-module.packages.${system}.default;
         lgxTool = logos-package.packages.${system}.lgx;
       });
     in
     {
-      packages = forAllSystems ({ pkgs, logosSdk, logosLiblogos, logosStorage, logosDelivery, lgxTool }:
+      packages = forAllSystems ({ pkgs, logosSdk, logosLiblogos, logosDelivery, lgxTool }:
         let
           buildInputs = [ pkgs.qt6.qtbase ];
 
@@ -67,7 +64,6 @@
             # delivery_module alongside storage for reproducibility.
             cmakeFlags = [
               "-DLOGOS_CPP_SDK_ROOT=${logosSdk}"
-              "-DLOGOS_STORAGE_ROOT=${logosStorage}"
               "-GNinja"
             ];
 
