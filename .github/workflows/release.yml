@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.pkg.name }}.lgx
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        pkg:
+          - { dir: module, name: yolo-board-module, artifact: yolo-board-module.lgx }
+          - { dir: ui,     name: yolo-board,        artifact: yolo-board.lgx }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build ${{ matrix.pkg.name }}
+        run: |
+          cd ${{ matrix.pkg.dir }}
+          nix build .#lgx --print-build-logs
+
+      - name: Stage artifact for release
+        run: |
+          mkdir -p staged
+          cp ${{ matrix.pkg.dir }}/result/${{ matrix.pkg.artifact }} staged/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg.artifact }}
+          path: staged/${{ matrix.pkg.artifact }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Attach lgx artifacts to release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
+          files: |
+            dist/yolo-board-module.lgx
+            dist/yolo-board.lgx
+          fail_on_unmatched_files: true

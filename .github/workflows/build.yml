@@ -1,0 +1,48 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.pkg.name }}.lgx
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg:
+          - { dir: module, name: yolo-board-module, artifact: yolo-board-module.lgx }
+          - { dir: ui,     name: yolo-board,        artifact: yolo-board.lgx }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Enable magic nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build ${{ matrix.pkg.name }}
+        run: |
+          cd ${{ matrix.pkg.dir }}
+          nix build .#lgx --print-build-logs
+
+      - name: Upload ${{ matrix.pkg.artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg.artifact }}
+          path: ${{ matrix.pkg.dir }}/result/${{ matrix.pkg.artifact }}
+          if-no-files-found: error
+          retention-days: 14
