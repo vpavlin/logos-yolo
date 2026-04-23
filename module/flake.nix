@@ -13,7 +13,12 @@
       inputs.logos-cpp-sdk.follows = "logos-cpp-sdk";
     };
     logos-storage-module = {
-      url = "github:logos-co/logos-storage-module";
+      # Points at our fork until the storage-nim narHash drift is fixed
+      # upstream (open PR: vpavlin/logos-storage-module branch
+      # fix/storage-nim-narhash-drift). Only the flake.lock narHash of
+      # the transitive logos-storage-nim submodule-bearing git input is
+      # relocked to the currently-reproducible value; no source changes.
+      url = "github:vpavlin/logos-storage-module/fix/storage-nim-narhash-drift";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     logos-delivery-module = {

@@ -72,7 +72,7 @@ logos-scaffold basecamp launch bob   --no-clean &
 
 Build workflows live in `.github/workflows/{build,release}.yml`. On push to `master` they matrix-build `module/#lgx` and `ui/#lgx` via `nix build`; on tag push matching `v*` they additionally attach both artifacts to a GitHub release.
 
-The `module/` build currently **fails on clean CI runners** because `logos-storage-module`'s transitive dep `logos-storage-nim` has a NAR hash mismatch on a submodule-bearing git input — upstream issue, not reproducible from our flake.lock alone. Local builds succeed because the nix store already contains a cached derivation. Unblock when upstream fixes the lockfile or publishes a binary cache. The `ui/` build runs green.
+The `module/` build now points at [a forked `logos-storage-module`](https://github.com/vpavlin/logos-storage-module/tree/fix/storage-nim-narhash-drift) that relocks the transitive `logos-storage-nim` NAR hash to its currently-reproducible value — resolved the CI-side build failure. Upstream fix (PR pending) restores pointing back to `logos-co/logos-storage-module`.
 
 ## Known sharp edges
 

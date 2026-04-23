@@ -3514,15 +3514,16 @@
         "logos-storage": "logos-storage"
       },
       "locked": {
-        "lastModified": 1776086401,
-        "narHash": "sha256-u2mHh0dZDpoAAL8m2r4VzQsat4fQMGaOwskBnwCQx7k=",
-        "owner": "logos-co",
+        "lastModified": 1776942630,
+        "narHash": "sha256-QhxKInUM3IWmHS1C5GqYY6zp2eAkbzW2TmyH3l3Kj8k=",
+        "owner": "vpavlin",
         "repo": "logos-storage-module",
-        "rev": "321283bb2de4630084c22b6627e1e846878c7c10",
+        "rev": "0ae81511462df0243293586ed81d810bc818bc10",
         "type": "github"
       },
       "original": {
-        "owner": "logos-co",
+        "owner": "vpavlin",
+        "ref": "fix/storage-nim-narhash-drift",
         "repo": "logos-storage-module",
         "type": "github"
       }
