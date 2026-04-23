@@ -14,14 +14,16 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.pkg.name }}.lgx
+    name: Build ${{ matrix.pkg.name }}.lgx (${{ matrix.pkg.flavour }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
       matrix:
         pkg:
-          - { dir: module, name: yolo-board-module, artifact: yolo-board-module.lgx }
-          - { dir: ui,     name: yolo-board,        artifact: yolo-board.lgx }
+          - { dir: module, name: yolo-board-module, artifact: yolo-board-module.lgx, attr: lgx,          flavour: dev,      release-name: yolo-board-module.lgx }
+          - { dir: ui,     name: yolo-board,        artifact: yolo-board.lgx,        attr: lgx,          flavour: dev,      release-name: yolo-board.lgx }
+          - { dir: module, name: yolo-board-module, artifact: yolo-board-module.lgx, attr: lgx-portable, flavour: portable, release-name: yolo-board-module-portable.lgx }
+          - { dir: ui,     name: yolo-board,        artifact: yolo-board.lgx,        attr: lgx-portable, flavour: portable, release-name: yolo-board-portable.lgx }
     steps:
       - uses: actions/checkout@v4
 
@@ -34,20 +36,20 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build ${{ matrix.pkg.name }}
+      - name: Build ${{ matrix.pkg.name }} (${{ matrix.pkg.flavour }})
         run: |
           cd ${{ matrix.pkg.dir }}
-          nix build .#lgx --print-build-logs
+          nix build .#${{ matrix.pkg.attr }} --print-build-logs
 
-      - name: Stage artifact for release
+      - name: Stage artifact under release name
         run: |
           mkdir -p staged
-          cp ${{ matrix.pkg.dir }}/result/${{ matrix.pkg.artifact }} staged/
+          cp ${{ matrix.pkg.dir }}/result/${{ matrix.pkg.artifact }} staged/${{ matrix.pkg.release-name }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.pkg.artifact }}
-          path: staged/${{ matrix.pkg.artifact }}
+          name: ${{ matrix.pkg.release-name }}
+          path: staged/${{ matrix.pkg.release-name }}
           if-no-files-found: error
           retention-days: 1
 
@@ -84,4 +86,6 @@ jobs:
           files: |
             dist/yolo-board-module.lgx
             dist/yolo-board.lgx
+            dist/yolo-board-module-portable.lgx
+            dist/yolo-board-portable.lgx
           fail_on_unmatched_files: true

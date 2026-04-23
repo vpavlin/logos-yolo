@@ -79,7 +79,7 @@ The `module/` build vendors `storage_module_api.{h,cpp}` under `module/vendor/st
 - `set_node_url` on zone-sequencer takes ~20 s cold-start even after our init reorder (zone-sequencer-side QRO source registration — file upstream).
 - `storage_module.init()` also takes ~80 s cold-start; parallel with delivery so no wall-clock impact.
 - Thread-reply payload carries `nick` in cleartext with no signature (spoofable); Ed25519 signing is planned.
-- No AppImage build yet — requires `#lgx-portable` flake outputs on both packages.
+- AppImage support is experimental. Both `module/` and `ui/` expose `#lgx-portable` outputs (RPATH stripped to `$ORIGIN`, Qt6Core / Qml / Quick / ICU copied next to the plugin) and CI publishes `*-portable.lgx` artifacts alongside the dev ones. Builds green but end-to-end load inside a released basecamp AppImage hasn't been verified — the first `v*` release should exercise this.
 
 ## Development
 

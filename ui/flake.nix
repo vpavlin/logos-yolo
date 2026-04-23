@@ -151,13 +151,39 @@
           };
 
           # ── LGX bundle ───────────────────────────────────────────────────
-          patchManifest = name: metadataFile: ''
-            python3 - ${name}.lgx ${metadataFile} <<'PY'
+          # Portable flavour strips /nix/store from the plugin's RPATH and
+          # co-locates Qt + QtDeclarative + ICU runtime libs next to the .so
+          # so AppImage basecamps can resolve them via $ORIGIN.
+          pluginPortable = plugin.overrideAttrs (old: {
+            pname = "${old.pname}-portable";
+            postFixup = ''
+              patchelf --set-rpath '$ORIGIN' $out/lib/yolo_board.so
+              patchelf --set-rpath '$ORIGIN' $out/lib/libzone_sequencer_rs.so 2>/dev/null || true
+            '';
+          });
+
+          qtRuntimeLibs = pkgs.runCommand "yolo-board-qt-runtime" {} ''
+            mkdir -p $out
+            for lib in libQt6Core libQt6Concurrent libQt6Qml libQt6QmlMeta libQt6QmlModels \
+                       libQt6QmlWorkerScript libQt6Quick libQt6QuickControls2 \
+                       libQt6QuickControls2Impl libQt6QuickLayouts libQt6QuickTemplates2 \
+                       libQt6Gui libQt6Network libQt6DBus libQt6OpenGL; do
+              cp -L ${pkgs.qt6.qtbase}/lib/$lib.so.6        $out/ 2>/dev/null || true
+              cp -L ${pkgs.qt6.qtdeclarative}/lib/$lib.so.6 $out/ 2>/dev/null || true
+            done
+            cp -L ${pkgs.icu}/lib/libicui18n.so.*   $out/ 2>/dev/null || true
+            cp -L ${pkgs.icu}/lib/libicuuc.so.*     $out/ 2>/dev/null || true
+            cp -L ${pkgs.icu}/lib/libicudata.so.*   $out/ 2>/dev/null || true
+            chmod 0644 $out/*.so* 2>/dev/null || true
+          '';
+
+          patchManifest = name: metadataFile: variantSet: ''
+            python3 - ${name}.lgx ${metadataFile} ${variantSet} <<'PY'
             import json, sys, tarfile, io
             lgx_path = sys.argv[1]
             with open(sys.argv[2]) as f:
                 metadata = json.load(f)
-            built_variants = {'linux-x86_64-dev', 'linux-amd64-dev'}
+            built_variants = set(sys.argv[3].split(','))
             with tarfile.open(lgx_path, 'r:gz') as tar:
                 members = [(m, tar.extractfile(m).read() if m.isfile() else None) for m in tar.getmembers()]
             patched = []
@@ -168,9 +194,6 @@
                         if key in metadata:
                             manifest[key] = metadata[key]
                     if 'main' in manifest and isinstance(manifest['main'], dict):
-                        # Keep `-dev` suffix — basecamp matches the installed
-                        # `variant` file (e.g. linux-x86_64-dev) against manifest
-                        # `main` keys. Stripping `-dev` silently breaks loading.
                         manifest["main"] = {k: v for k, v in manifest["main"].items() if k in built_variants}
                     data = json.dumps(manifest, indent=2).encode()
                     member.size = len(data)
@@ -184,25 +207,37 @@
             PY
           '';
 
-          lgx = pkgs.runCommand "yolo-board.lgx" {
-            nativeBuildInputs = [ lgxTool pkgs.python3 ];
-          } ''
-            lgx create yolo-board
-            mkdir -p variant-files
-            cp ${plugin}/lib/yolo_board.so variant-files/
-            cp ${plugin}/lib/libzone_sequencer_rs.so variant-files/
-            cp ${plugin}/lib/yolo.png variant-files/
-            cp ${plugin}/qml/Main.qml variant-files/
-            lgx add yolo-board.lgx --variant linux-x86_64-dev --files ./variant-files --main yolo_board.so -y
-            lgx add yolo-board.lgx --variant linux-amd64-dev  --files ./variant-files --main yolo_board.so -y
-            lgx verify yolo-board.lgx
-            ${patchManifest "yolo-board" "${self}/metadata.json"}
-            mkdir -p $out
-            cp yolo-board.lgx $out/yolo-board.lgx
-          '';
+          mkLgx = { variant-suffix, variant-set, bundle-qt ? false }:
+            pkgs.runCommand "yolo-board.lgx${variant-suffix}" {
+              nativeBuildInputs = [ lgxTool pkgs.python3 ];
+            } ''
+              lgx create yolo-board
+              mkdir -p variant-files
+              cp ${if variant-suffix == "" then plugin else pluginPortable}/lib/yolo_board.so variant-files/
+              cp ${if variant-suffix == "" then plugin else pluginPortable}/lib/libzone_sequencer_rs.so variant-files/
+              cp ${plugin}/lib/yolo.png variant-files/
+              cp ${plugin}/qml/Main.qml variant-files/
+              ${if bundle-qt then "cp -L ${qtRuntimeLibs}/*.so* variant-files/ 2>/dev/null || true" else ""}
+
+              ${if variant-suffix == "" then ''
+                lgx add yolo-board.lgx --variant linux-x86_64-dev --files ./variant-files --main yolo_board.so -y
+                lgx add yolo-board.lgx --variant linux-amd64-dev  --files ./variant-files --main yolo_board.so -y
+              '' else ''
+                lgx add yolo-board.lgx --variant linux-x86_64 --files ./variant-files --main yolo_board.so -y
+                lgx add yolo-board.lgx --variant linux-amd64  --files ./variant-files --main yolo_board.so -y
+              ''}
+
+              lgx verify yolo-board.lgx
+              ${patchManifest "yolo-board" "${self}/metadata.json" variant-set}
+              mkdir -p $out
+              cp yolo-board.lgx $out/yolo-board.lgx
+            '';
+
+          lgx          = mkLgx { variant-suffix = "";          variant-set = "linux-x86_64-dev,linux-amd64-dev"; };
+          lgx-portable = mkLgx { variant-suffix = "-portable"; variant-set = "linux-x86_64,linux-amd64"; bundle-qt = true; };
 
         in {
-          inherit plugin app lgx rustLib;
+          inherit plugin pluginPortable app lgx lgx-portable rustLib;
           default = lgx;
         }
       );

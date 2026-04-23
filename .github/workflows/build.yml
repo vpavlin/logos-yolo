@@ -12,14 +12,21 @@ concurrency:
 
 jobs:
   build:
-    name: Build ${{ matrix.pkg.name }}.lgx
+    name: Build ${{ matrix.pkg.name }}.lgx (${{ matrix.pkg.flavour }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         pkg:
-          - { dir: module, name: yolo-board-module, artifact: yolo-board-module.lgx }
-          - { dir: ui,     name: yolo-board,        artifact: yolo-board.lgx }
+          # Dev flavour — linked against workspace Qt + liblogos; variant keys
+          # are `linux-*-dev`; consumed by scaffold-built basecamps.
+          - { dir: module, name: yolo-board-module, artifact: yolo-board-module.lgx,          attr: lgx,          flavour: dev,      upload-name: yolo-board-module.lgx }
+          - { dir: ui,     name: yolo-board,        artifact: yolo-board.lgx,                 attr: lgx,          flavour: dev,      upload-name: yolo-board.lgx }
+          # Portable flavour — RPATH stripped to $ORIGIN, Qt runtime bundled
+          # next to the plugin; variant keys are `linux-*` (no `-dev`);
+          # consumed by released basecamp AppImages.
+          - { dir: module, name: yolo-board-module, artifact: yolo-board-module.lgx,          attr: lgx-portable, flavour: portable, upload-name: yolo-board-module-portable.lgx }
+          - { dir: ui,     name: yolo-board,        artifact: yolo-board.lgx,                 attr: lgx-portable, flavour: portable, upload-name: yolo-board-portable.lgx }
     steps:
       - uses: actions/checkout@v4
 
@@ -34,15 +41,15 @@ jobs:
       - name: Enable magic nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build ${{ matrix.pkg.name }}
+      - name: Build ${{ matrix.pkg.name }} (${{ matrix.pkg.flavour }})
         run: |
           cd ${{ matrix.pkg.dir }}
-          nix build .#lgx --print-build-logs
+          nix build .#${{ matrix.pkg.attr }} --print-build-logs
 
-      - name: Upload ${{ matrix.pkg.artifact }}
+      - name: Upload ${{ matrix.pkg.upload-name }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.pkg.artifact }}
+          name: ${{ matrix.pkg.upload-name }}
           path: ${{ matrix.pkg.dir }}/result/${{ matrix.pkg.artifact }}
           if-no-files-found: error
           retention-days: 14
