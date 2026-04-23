@@ -72,7 +72,7 @@ logos-scaffold basecamp launch bob   --no-clean &
 
 Build workflows live in `.github/workflows/{build,release}.yml`. On push to `master` they matrix-build `module/#lgx` and `ui/#lgx` via `nix build`; on tag push matching `v*` they additionally attach both artifacts to a GitHub release.
 
-The `module/` build now points at [a forked `logos-storage-module`](https://github.com/vpavlin/logos-storage-module/tree/fix/storage-nim-narhash-drift) that relocks the transitive `logos-storage-nim` NAR hash to its currently-reproducible value — resolved the CI-side build failure. Upstream fix (PR pending) restores pointing back to `logos-co/logos-storage-module`.
+The `module/` build vendors `storage_module_api.{h,cpp}` under `module/vendor/storage_module_api/` instead of depending on the `logos-storage-module` flake, because that flake transitively fetches `logos-storage-nim` with `?submodules=1` and produces a non-reproducible NAR hash across environments. Regeneration instructions live in that vendor dir. Both `module/` and `ui/` CI builds run green.
 
 ## Known sharp edges
 
