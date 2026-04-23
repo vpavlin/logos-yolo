@@ -1,0 +1,2095 @@
+#include "yolo_board_module.h"
+#include "logos_api.h"
+#include "logos_api_client.h"
+#include "logos_object.h"
+#include "storage_module_api.h"
+
+#include <QCryptographicHash>
+#include <QDebug>
+#include <QDir>
+#include <QEventLoop>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <QUuid>
+#include <QRegularExpression>
+#include <QTextStream>
+#include <QThread>
+#include <QUrl>
+
+const char* YoloBoardModule::kZoneModuleName = "liblogos_zone_sequencer_module";
+const char* YoloBoardModule::kStorageModuleName = "storage_module";
+const char* YoloBoardModule::kDeliveryModuleName = "delivery_module";
+
+static QString uiConfigPath() {
+    // Respect XDG_CONFIG_HOME so multiple Basecamp profiles on one host
+    // can have their own saved yolo config (data dir, node URL, peer ids).
+    // Without this, every instance reads ~/.config/logos/yolo_board.json
+    // and they silently share a dataDir / identity — hard to notice
+    // because configure() still succeeds, it just picks up another
+    // instance's key + channel.
+    QString xdg = qEnvironmentVariable("XDG_CONFIG_HOME");
+    if (xdg.isEmpty()) xdg = QDir::homePath() + "/.config";
+    QString dir = xdg + "/logos";
+    QDir().mkpath(dir);
+    return dir + "/yolo_board.json";
+}
+
+// ── Constructor / Destructor ─────────────────────────────────────────────────
+
+YoloBoardModule::YoloBoardModule() {
+    m_pollTimer = new QTimer(this);
+    m_pollTimer->setInterval(kPollIntervalMs);
+    connect(m_pollTimer, &QTimer::timeout, this, &YoloBoardModule::pollNextChannel);
+}
+
+YoloBoardModule::~YoloBoardModule() {
+    m_alive->store(false);
+    if (m_pollTimer) m_pollTimer->stop();
+    for (auto& c : m_backfillCancelled) c->store(true);
+    QThreadPool::globalInstance()->waitForDone(5000);
+}
+
+static void ybmDiag(const QString& line);  // fwd decl; defined below
+
+void YoloBoardModule::initLogos(LogosAPI* api) {
+    if (logosAPI) return;
+    logosAPI = api;
+    qInfo() << "YoloBoardModule: initLogos called";
+    // Reset diagnostic log per plugin load for easier tailing.
+    QFile::remove(QStringLiteral("/tmp/yolo_board_module.diag"));
+    ybmDiag(QStringLiteral("initLogos begin"));
+
+    // Load saved config so get_state returns the persisted dataDir/nodeUrl
+    // even before the user clicks Connect. The UI can then show them and
+    // auto-trigger configure().
+    {
+        QFile f(uiConfigPath());
+        if (f.open(QIODevice::ReadOnly)) {
+            QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+            if (doc.isObject()) {
+                QJsonObject obj = doc.object();
+                m_dataDir = obj["dataDir"].toString();
+                m_nodeUrl = obj["nodeUrl"].toString();
+                m_savedPeerId = obj["peerId"].toString();
+                m_savedPeerAddrs = obj["peerAddrs"].toString();
+                qInfo() << "YoloBoardModule: loaded saved config dataDir=" << m_dataDir
+                        << "nodeUrl=" << m_nodeUrl
+                        << "peerId=" << m_savedPeerId;
+            }
+        }
+    }
+
+    // Construct the typed storage wrapper and subscribe its events
+    // IMMEDIATELY in initLogos — mirroring logos-irc-module's pattern. We
+    // are NOT inside a Q_INVOKABLE IPC handler here (logos_host calls us
+    // directly during plugin load), so the QRO-servicing-thread-deadlock
+    // concern doesn't apply yet and we can call sync operations freely.
+    //
+    // StorageModule's ctor is cheap — it only calls logosAPI->getClient()
+    // and stores the pointer. The first blocking call (ensureReplica via
+    // .on()) happens during subscribeStorageEvents(); storage_module is a
+    // declared dependency in metadata.json, so its QRO source is already
+    // published by the time we get here.
+    m_storage = new StorageModule(logosAPI);
+    ybmDiag(QStringLiteral("StorageModule constructed"));
+    subscribeStorageEvents();
+    ybmDiag(QStringLiteral("subscribeStorageEvents done"));
+
+    // Delivery (Waku pub/sub) — we use raw QRO IPC, no typed wrapper (see
+    // comment in header). The client pointer is cheap to acquire; the
+    // replica that carries events is acquired lazily in
+    // subscribeDeliveryEvents since requestObject() can block briefly.
+    m_deliveryClient = logosAPI->getClient(kDeliveryModuleName);
+    ybmDiag(QStringLiteral("deliveryClient obtained=%1").arg(m_deliveryClient != nullptr));
+    subscribeDeliveryEvents();
+    ybmDiag(QStringLiteral("subscribeDeliveryEvents done"));
+
+    // Load persisted "My threads" list so the UI can render it immediately.
+    // These are NOT auto-resubscribed — user rejoins manually.
+    loadParticipatedThreads();
+
+    m_zoneClient = logosAPI->getClient(kZoneModuleName);
+    ybmDiag(QStringLiteral("zoneClient obtained"));
+
+    // Auto-connect with saved config. configure() defers its body via one
+    // QTimer::singleShot(0), which is still needed (configure is reachable
+    // via Q_INVOKABLE from QML/logoscore later; same entry point used here
+    // to keep behavior consistent).
+    if (!m_dataDir.isEmpty() && !m_nodeUrl.isEmpty() && !m_connected) {
+        qInfo() << "YoloBoardModule: auto-connecting with saved config";
+        configure(m_dataDir, m_nodeUrl);
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+QVariant YoloBoardModule::zoneCall(const QString& method, const QVariantList& args) {
+    qInfo() << "YoloBoardModule::zoneCall" << method << "logosAPI=" << (logosAPI != nullptr);
+    if (!m_zoneClient && logosAPI) {
+        m_zoneClient = logosAPI->getClient(kZoneModuleName);
+        qInfo() << "YoloBoardModule::zoneCall got client:" << (m_zoneClient != nullptr);
+    }
+    if (!m_zoneClient) {
+        qWarning() << "YoloBoardModule::zoneCall no client!";
+        return {};
+    }
+    qInfo() << "YoloBoardModule::zoneCall invoking" << method;
+    QVariant r = m_zoneClient->invokeRemoteMethod(kZoneModuleName, method, args);
+    qInfo() << "YoloBoardModule::zoneCall returned for" << method;
+    return r;
+}
+
+QString YoloBoardModule::encodeChannelName(const QString& name) {
+    static const QByteArray prefix = QByteArrayLiteral("logos:yolo:");
+    QByteArray raw = prefix + name.toUtf8();
+    if (raw.size() > 32) return {};
+    raw = raw.leftJustified(32, '\0');
+    return QString::fromLatin1(raw.toHex());
+}
+
+QString YoloBoardModule::decodeChannelName(const QString& hexId) {
+    QByteArray bytes = QByteArray::fromHex(hexId.toLatin1());
+    if (bytes.size() != 32) return {};
+    static const QByteArray prefix = QByteArrayLiteral("logos:yolo:");
+    if (!bytes.startsWith(prefix)) return {};
+    QByteArray name = bytes.mid(prefix.size());
+    int end = name.size();
+    while (end > 0 && name[end - 1] == '\0') --end;
+    return QString::fromUtf8(name.left(end));
+}
+
+QString YoloBoardModule::channelDisplayName(const QString& channelId) {
+    QString name = decodeChannelName(channelId);
+    if (!name.isEmpty()) return name;
+    if (channelId.length() > 12) return channelId.left(12) + QStringLiteral("\u2026");
+    return channelId;
+}
+
+QString YoloBoardModule::mediaCacheDir() const {
+    if (m_dataDir.isEmpty()) return {};
+    return m_dataDir + "/media_cache";
+}
+
+QString YoloBoardModule::mediaCachePath(const QString& cid) const {
+    QString dir = mediaCacheDir();
+    if (dir.isEmpty()) return {};
+    return dir + "/" + cid;
+}
+
+QString YoloBoardModule::cacheFilePath(const QString& channelId) const {
+    if (m_dataDir.isEmpty()) return {};
+    return m_dataDir + "/cache/" + channelId + ".json";
+}
+
+QVariantMap YoloBoardModule::parseMessagePayload(const QString& data) {
+    QString trimmed = data.trimmed();
+    if (!trimmed.startsWith('{'))
+        return {{"text", data}, {"media", QVariantList{}}};
+    QJsonDocument doc = QJsonDocument::fromJson(data.toUtf8());
+    if (!doc.isObject())
+        return {{"text", data}, {"media", QVariantList{}}};
+    QJsonObject obj = doc.object();
+    if (!obj.contains("v"))
+        return {{"text", data}, {"media", QVariantList{}}};
+
+    QVariantMap result;
+    result["text"] = obj["text"].toString();
+    QVariantList media;
+    for (const QJsonValue& m : obj["media"].toArray()) {
+        QJsonObject mo = m.toObject();
+        QVariantMap entry;
+        entry["cid"]  = mo["cid"].toString();
+        entry["type"] = mo["type"].toString();
+        entry["name"] = mo["name"].toString();
+        entry["size"] = mo["size"].toInt();
+        media.append(entry);
+    }
+    result["media"] = media;
+    return result;
+}
+
+QVariantList YoloBoardModule::buildChannelList() const {
+    QVariantList list;
+    for (const QString& id : m_channelIds) {
+        QVariantMap entry;
+        entry["id"] = id;
+        entry["name"] = decodeChannelName(id).isEmpty()
+            ? (id.length() > 12 ? id.left(12) + QStringLiteral("\u2026") : id)
+            : decodeChannelName(id);
+        entry["isOwn"] = (id == m_ownChannelId);
+        entry["unread"] = m_unreadCounts.value(id, 0);
+        list.append(entry);
+    }
+    return list;
+}
+
+void YoloBoardModule::setStatus(const QString& msg) {
+    if (m_status == msg) return;
+    m_status = msg;
+    qInfo() << "YoloBoardModule status:" << msg;
+    emitStatusChanged();
+}
+
+// ── Cache persistence ────────────────────────────────────────────────────────
+
+void YoloBoardModule::loadCacheForChannel(const QString& channelId) {
+    QString path = cacheFilePath(channelId);
+    if (path.isEmpty()) return;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return;
+    QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+    if (!doc.isArray()) return;
+
+    QVariantList& existing = m_allMessages[channelId];
+    QSet<QString> seenIds;
+    for (const QVariant& v : existing)
+        seenIds.insert(v.toMap().value("id").toString());
+
+    QVariantList loaded;
+    for (const QJsonValue& val : doc.array()) {
+        QJsonObject obj = val.toObject();
+        QString id = obj["block_id"].toString();
+        if (id.isEmpty() || seenIds.contains(id)) continue;
+        QVariantMap msg;
+        msg["id"]        = id;
+        msg["data"]      = obj["text"].toString();
+        msg["channel"]   = channelId;
+        msg["isOwn"]     = (channelId == m_ownChannelId);
+        msg["timestamp"] = obj["timestamp"].toString();
+        msg["pending"]   = false;
+        msg["failed"]    = false;
+        QVariantMap parsed = parseMessagePayload(msg["data"].toString());
+        msg["displayText"] = parsed["text"];
+        msg["media"]       = parsed["media"];
+        loaded.append(msg);
+        seenIds.insert(id);
+    }
+    if (!loaded.isEmpty())
+        existing = loaded + existing;
+}
+
+void YoloBoardModule::saveCacheForChannel(const QString& channelId) {
+    QString path = cacheFilePath(channelId);
+    if (path.isEmpty()) return;
+    QDir().mkpath(QFileInfo(path).absolutePath());
+
+    const QVariantList& msgs = m_allMessages.value(channelId);
+    QJsonArray arr;
+    int start = qMax(0, (int)msgs.size() - kMaxCachedMsgs);
+    for (int i = start; i < msgs.size(); ++i) {
+        QVariantMap m = msgs[i].toMap();
+        if (m.value("pending", false).toBool()) continue;
+        if (m.value("failed",  false).toBool()) continue;
+        QJsonObject obj;
+        obj["block_id"]  = m["id"].toString();
+        obj["text"]      = m["data"].toString();
+        obj["timestamp"] = m["timestamp"].toString();
+        arr.append(obj);
+    }
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+// ── Subscription persistence ─────────────────────────────────────────────────
+
+void YoloBoardModule::saveSubscriptions() {
+    if (m_dataDir.isEmpty()) return;
+    QString path = m_dataDir + "/subscriptions.json";
+    QJsonArray arr;
+    for (const QString& ch : m_channelIds)
+        if (ch != m_ownChannelId)
+            arr.append(ch);
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void YoloBoardModule::loadSubscriptions() {
+    if (m_dataDir.isEmpty()) return;
+    QString path = m_dataDir + "/subscriptions.json";
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return;
+    QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+    if (!doc.isArray()) return;
+    for (const QJsonValue& val : doc.array()) {
+        QString ch = val.toString();
+        if (ch.isEmpty() || m_channelIds.contains(ch)) continue;
+        m_channelIds.append(ch);
+        m_unreadCounts[ch] = 0;
+        loadCacheForChannel(ch);
+    }
+}
+
+// ── Initialization ───────────────────────────────────────────────────────────
+
+bool YoloBoardModule::loadKeyFromFile() {
+    if (m_dataDir.isEmpty()) return false;
+    QString path = m_dataDir + "/sequencer.key";
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return false;
+    QByteArray raw = f.readAll();
+    if (raw.size() != 32) return false;
+    m_signingKey = QString::fromLatin1(raw.toHex());
+    return true;
+}
+
+bool YoloBoardModule::loadChannelFromFile() {
+    if (m_dataDir.isEmpty()) return false;
+    QString path = m_dataDir + "/channel.id";
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return false;
+    QByteArray raw = f.readAll();
+    if (raw.size() != 32) return false;
+    m_ownChannelId = QString::fromLatin1(raw.toHex());
+    return true;
+}
+
+void YoloBoardModule::initSequencer() {
+    // Per-step timing — when sequencer init takes 100+ s we want to know
+    // whether it's set_node_url (ought to be ms) or load_from_directory
+    // (chain sync — slowness belongs to zone-sequencer, not us).
+    qInfo() << "YoloBoardModule: initSequencer: set_node_url";
+    QElapsedTimer t; t.start();
+    ybmDiag(QStringLiteral("initSequencer: set_node_url begin"));
+    zoneCall("set_node_url", {m_nodeUrl});
+    ybmDiag(QStringLiteral("initSequencer: set_node_url done elapsedMs=%1").arg(t.elapsed()));
+
+    qInfo() << "YoloBoardModule: load_from_directory";
+    t.restart();
+    ybmDiag(QStringLiteral("initSequencer: load_from_directory begin"));
+    // Single IPC call that does signing_key + checkpoint + channel_id
+    QString chId = zoneCall("load_from_directory", {m_dataDir}).toString();
+    ybmDiag(QStringLiteral("initSequencer: load_from_directory done elapsedMs=%1 result=%2")
+                .arg(t.elapsed()).arg(chId.left(24)));
+    qInfo() << "YoloBoardModule: load_from_directory result:" << chId;
+    if (!chId.isEmpty() && !chId.startsWith("Error:"))
+        m_ownChannelId = chId;
+
+    qInfo() << "YoloBoardModule: initSequencer done, ownChannelId=" << m_ownChannelId;
+}
+
+void YoloBoardModule::initStorage() {
+    if (m_storageReady) return;
+    if (!m_storage) {
+        if (!logosAPI) {
+            qWarning() << "YoloBoardModule::initStorage: no logosAPI yet";
+            return;
+        }
+        // Safety fallback — normally constructed in initLogos.
+        m_storage = new StorageModule(logosAPI);
+        subscribeStorageEvents();
+    }
+
+    QString storageDir = m_dataDir + "/storage";
+    QDir().mkpath(storageDir);
+    QJsonObject cfg;
+    cfg["data-dir"] = storageDir;
+    QString cfgJson = QString::fromUtf8(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
+
+    // Sync init — server-side storage_new + waitSync(1000) returns ~ms.
+    ybmDiag(QStringLiteral("initStorage: calling init()"));
+    bool initOk = m_storage->init(cfgJson);
+    ybmDiag(QStringLiteral("initStorage: init() returned %1").arg(initOk));
+    if (!initOk) {
+        setStatus("Storage init failed");
+        emitStateChanged();
+        return;
+    }
+
+    // Sync start — StorageModuleImpl::start() detaches libstorage.storage_start
+    // to a std::thread and returns true immediately. Real readiness fires
+    // via the "storageStart" event (see subscribeStorageEvents).
+    ybmDiag(QStringLiteral("initStorage: calling start()"));
+    bool acc = m_storage->start();
+    ybmDiag(QStringLiteral("initStorage: start() returned %1").arg(acc));
+    if (!acc) {
+        setStatus("Storage start rejected");
+        emitStateChanged();
+        return;
+    }
+    // Ideally we'd flip m_storageReady on the "storageStart" event, but in
+    // the out-of-process QRO setup we're in, events from storage_module
+    // don't reach our subscription path reliably (the generated StorageModule
+    // wrapper's .on() returns true, but handlers never fire). Since start()
+    // blocked until libstorage's 27 s storage_start synchronously returned
+    // (server-side is detached but its reply arrives only after), we know
+    // storage is actually ready by this point — flip readiness here.
+    m_storageReady = true;
+    refreshStorageInfo();
+    setStatus(QStringLiteral("Connected to ") + m_nodeUrl);
+    emitStateChanged();
+    ybmDiag(QStringLiteral("initStorage: m_storageReady=true (polled)"));
+}
+
+void YoloBoardModule::refreshStorageInfo() {
+    if (!m_storage) return;
+    // m_storage->debug() is sync IPC that spins a nested event loop. While
+    // it's waiting, the storageStart event, get_state polls, and the polled
+    // fallback can all re-enter this function and queue *another* debug()
+    // call on the same storage replica. In practice that piles up 40 s QRO
+    // timeouts and costs ~80 s of pure wall time on startup. Guard re-entry.
+    if (m_refreshingStorageInfo) return;
+    // Once populated, don't re-hit the wire on every caller.
+    if (!m_storagePeerId.isEmpty() && !m_storageListenAddrs.isEmpty()) return;
+    m_refreshingStorageInfo = true;
+    LogosResult r = m_storage->debug();
+    m_refreshingStorageInfo = false;
+    if (!r.success) {
+        ybmDiag(QStringLiteral("refreshStorageInfo: debug() failed err=%1").arg(r.error.toString()));
+        return;
+    }
+    m_storagePeerId        = r.getString("id");
+    m_storageSpr           = r.getString("spr");
+    m_storageListenAddrs   = r.getValue<QStringList>("addrs");
+    m_storageAnnounceAddrs = r.getValue<QStringList>("announceAddresses");
+    ybmDiag(QStringLiteral("storage info: peer=%1 addrs=[%2] announce=[%3]")
+                .arg(m_storagePeerId)
+                .arg(m_storageListenAddrs.join(','))
+                .arg(m_storageAnnounceAddrs.join(',')));
+}
+
+// Debug: append a line to a host-visible diagnostic file. qInfo from the
+// logos_host child process gets swallowed by the logoscore framework in
+// headless tests; a file is the cheapest way to see what actually ran.
+static void ybmDiag(const QString& line) {
+    QFile f(QStringLiteral("/tmp/yolo_board_module.diag"));
+    if (f.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream(&f) << QDateTime::currentDateTime().toString(Qt::ISODateWithMs)
+                        << " " << line << "\n";
+    }
+}
+
+void YoloBoardModule::subscribeStorageEvents() {
+    if (!m_storage || m_storageEventsBound) return;
+    m_storageEventsBound = true;
+    ybmDiag(QStringLiteral("subscribeStorageEvents: start"));
+
+    // Current storage_module emits events as QVariantList{bool ok, QString msg}
+    // (see EventCallbackCtx::handleResponse in storage_module_plugin.cpp).
+    // storageUploadDone carries a third element: the CID on success.
+    auto evtOk   = [](const QVariantList& d)       { return !d.isEmpty() && d[0].toBool(); };
+    auto evtStr  = [](const QVariantList& d, int i){ return d.size() > i ? d[i].toString() : QString(); };
+
+    bool okA = m_storage->on("storageStart", [this, evtOk, evtStr](const QVariantList& d) {
+        bool ok = evtOk(d);
+        QString msg = evtStr(d, 1);
+        ybmDiag(QStringLiteral("EVT storageStart ok=%1 msg=%2").arg(ok).arg(msg));
+        // Only flip to true on success. Never flip back to false — a method-
+        // level start() failure would have been caught by our fallback polling.
+        if (ok) {
+            m_storageReady = true;
+            refreshStorageInfo();
+            setStatus(QStringLiteral("Connected to ") + m_nodeUrl);
+            emitStateChanged();
+        }
+    });
+    ybmDiag(QStringLiteral("subscribe storageStart ok=%1").arg(okA));
+
+    bool okB = m_storage->on("storageUploadDone", [this, evtOk, evtStr](const QVariantList& d) {
+        bool ok = evtOk(d);
+        // Payload on success: [true, sessionId, cid]. Some builds send
+        // [true, cid] with the session id dropped. Best-effort: if there
+        // are 3 elements, d[1]=session, d[2]=cid. If 2, d[1]=cid and we
+        // match to a pending session by cid/filename later.
+        QString second = evtStr(d, 1);
+        QString third  = evtStr(d, 2);
+        ybmDiag(QStringLiteral("EVT storageUploadDone ok=%1 [1]=%2 [2]=%3")
+                    .arg(ok).arg(second).arg(third));
+        if (!ok) return;
+        QString sessionId = !third.isEmpty() ? second : QString();
+        QString cid       = !third.isEmpty() ? third  : second;
+        if (sessionId.isEmpty()) {
+            // Find a pending upload matching this cid (best effort)
+            for (auto it = m_pendingUploads.begin(); it != m_pendingUploads.end(); ++it) {
+                sessionId = it.key();
+                break;  // take the first; crude but works for single-upload flows
+            }
+        }
+        if (!sessionId.isEmpty()) handleUploadComplete(sessionId, cid);
+    });
+    ybmDiag(QStringLiteral("subscribe storageUploadDone ok=%1").arg(okB));
+
+    bool okC = m_storage->on("storageDownloadDone", [this, evtOk, evtStr](const QVariantList& d) {
+        bool ok = evtOk(d);
+        QString sid = evtStr(d, 1);
+        ybmDiag(QStringLiteral("EVT storageDownloadDone ok=%1 session=%2").arg(ok).arg(sid));
+        if (!ok) {
+            m_fetchingMedia.remove(sid);
+            return;
+        }
+        QString cid = sid;
+        QString cachePath = mediaCachePath(cid);
+        if (!cachePath.isEmpty() && QFile::exists(cachePath)) {
+            m_mediaPaths[cid] = cachePath;
+            emitMediaReady(cid, cachePath);
+            // Re-emit messages for any channel that has this cid so the UI
+            // refreshes the now-ready image placeholder.
+            for (const QString& chId : m_channelIds) {
+                for (const QVariant& v : m_allMessages.value(chId)) {
+                    for (const QVariant& mv : v.toMap()["media"].toList()) {
+                        if (mv.toMap()["cid"].toString() == cid) {
+                            emitMessagesChanged(chId);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        m_fetchingMedia.remove(cid);
+    });
+
+    bool okD = m_storage->on("storageConnect", [this, evtOk, evtStr](const QVariantList& d) {
+        bool ok = evtOk(d);
+        QString msg = evtStr(d, 1);
+        ybmDiag(QStringLiteral("EVT storageConnect ok=%1 msg=%2").arg(ok).arg(msg));
+        setStatus(ok ? QStringLiteral("Storage peer connected")
+                     : QStringLiteral("Storage peer connect failed: ") + msg);
+        emitStateChanged();
+    });
+    ybmDiag(QStringLiteral("subscribe storageConnect ok=%1").arg(okD));
+}
+
+void YoloBoardModule::handleUploadComplete(const QString& sessionId, const QString& cid) {
+    if (!m_pendingUploads.contains(sessionId)) {
+        qWarning() << "handleUploadComplete: unknown session" << sessionId;
+        return;
+    }
+    PendingUpload up = m_pendingUploads.take(sessionId);
+    qInfo() << "handleUploadComplete: session=" << sessionId << "cid=" << cid
+            << "file=" << up.fileName;
+
+    // Remove the placeholder pending message — publish() will add a fresh
+    // one with the real inscription id shortly.
+    QVariantList& msgs = m_allMessages[m_ownChannelId];
+    for (int i = 0; i < msgs.size(); ++i) {
+        if (msgs[i].toMap()["id"].toString() == up.pendingMsgId) {
+            msgs.removeAt(i);
+            break;
+        }
+    }
+
+    // Cache the original file locally so resolve_media serves it without
+    // a refetch across the network.
+    QFile src(up.filePath);
+    if (src.open(QIODevice::ReadOnly)) {
+        QByteArray data = src.readAll();
+        QString cachePath = mediaCachePath(cid);
+        if (!cachePath.isEmpty() && !data.isEmpty()) {
+            QDir().mkpath(mediaCacheDir());
+            QFile cache(cachePath);
+            if (cache.open(QIODevice::WriteOnly)) cache.write(data);
+        }
+        m_mediaPaths[cid] = cachePath;
+    }
+
+    // Build the YOLO board JSON payload and inscribe it on the zone.
+    QJsonObject payload;
+    payload["v"]    = 1;
+    payload["text"] = up.text;
+    QJsonArray media;
+    QJsonObject me;
+    me["cid"]  = cid;
+    me["type"] = up.mimeType;
+    me["name"] = up.fileName;
+    me["size"] = up.fileSize;
+    media.append(me);
+    payload["media"] = media;
+    QString msg = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+
+    m_uploading = false;
+    setStatus(QStringLiteral("Uploaded, publishing\u2026"));
+    emitStateChanged();
+    publish(msg);
+}
+
+// ── Delivery (Waku pub/sub) ──────────────────────────────────────────────────
+
+static bool deliveryBoolResult(const QVariant& r) {
+    // delivery_module's Q_INVOKABLE methods return LogosResult; over QRO
+    // that lands as a QVariant wrapping a LogosResult. Extract the bool.
+    if (r.canConvert<LogosResult>()) return r.value<LogosResult>().success;
+    return r.toBool();
+}
+
+static QString deliveryStringResult(const QVariant& r) {
+    // Extract the string payload from a LogosResult (requestId on send).
+    if (r.canConvert<LogosResult>()) {
+        LogosResult lr = r.value<LogosResult>();
+        return lr.success ? lr.value.toString() : QString();
+    }
+    return r.toString();
+}
+
+void YoloBoardModule::subscribeDeliveryEvents() {
+    if (m_deliveryEventsBound) return;
+    if (!m_deliveryClient) {
+        if (!logosAPI) return;
+        m_deliveryClient = logosAPI->getClient(kDeliveryModuleName);
+    }
+    if (!m_deliveryClient) return;
+    // Acquire the replica that carries the plugin's event channel. This
+    // blocks briefly (QRO sync) but delivery_module is a declared dep so
+    // its replica is published by the time we get here.
+    if (!m_deliveryReplica) {
+        m_deliveryReplica = m_deliveryClient->requestObject(kDeliveryModuleName);
+        if (!m_deliveryReplica) {
+            ybmDiag(QStringLiteral("subscribeDeliveryEvents: requestObject failed"));
+            return;
+        }
+    }
+    m_deliveryEventsBound = true;
+    ybmDiag(QStringLiteral("subscribeDeliveryEvents: start"));
+
+    auto evtStr = [](const QVariantList& d, int i){
+        return d.size() > i ? d[i].toString() : QString();
+    };
+
+    // messageReceived: [message_hash, content_topic, payload_b64, timestamp_ns]
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("messageReceived"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString topic   = evtStr(d, 1);
+            QString payload = evtStr(d, 2);
+            quint64 ts      = d.size() > 3 ? d[3].toString().toULongLong() : 0;
+            ybmDiag(QStringLiteral("EVT messageReceived topic=%1").arg(topic));
+            onThreadMessageReceived(topic, payload, ts);
+        });
+
+    // connectionStateChanged: [status, timestamp]. "connected" flips readiness.
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("connectionStateChanged"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString status = evtStr(d, 0);
+            bool connected = (status.compare(QStringLiteral("connected"), Qt::CaseInsensitive) == 0);
+            ybmDiag(QStringLiteral("EVT connectionStateChanged status=%1 connected=%2")
+                        .arg(status).arg(connected));
+            if (connected && !m_deliveryReady) {
+                m_deliveryReady = true;
+                m_deliveryStarting = false;
+                emitStateChanged();
+            } else if (!connected && m_deliveryReady) {
+                m_deliveryReady = false;
+                emitStateChanged();
+            }
+        });
+
+    // messageSent: [request_id, message_hash, timestamp]. The Waku relay has
+    // accepted our message. We already cleared `pending` on the immediate
+    // send-reply, so the additional signal here is `confirmed = true` —
+    // surfaced as a "delivered ✓" indicator in the UI to prove the message
+    // actually left our node and was acknowledged by at least one peer.
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("messageSent"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString reqId = evtStr(d, 0);
+            ybmDiag(QStringLiteral("EVT messageSent req=%1").arg(reqId));
+            QVariantMap ref = m_threadPendingById.take(reqId);
+            if (ref.isEmpty()) return;
+            QString topic    = ref.value("topic").toString();
+            QString localId  = ref.value("localMsgId").toString();
+            QVariantList& buf = m_threadMessages[topic];
+            for (int i = 0; i < buf.size(); ++i) {
+                QVariantMap m = buf[i].toMap();
+                if (m.value("id").toString() == localId) {
+                    m["pending"]   = false;
+                    m["failed"]    = false;
+                    m["confirmed"] = true;
+                    buf[i] = m;
+                    emitThreadMessagesChanged(topic);
+                    saveThreadMessages(topic);
+                    break;
+                }
+            }
+        });
+
+    // messageError: flip failed=true on matching local message.
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("messageError"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString reqId = evtStr(d, 0);
+            QString err   = evtStr(d, 2);
+            ybmDiag(QStringLiteral("EVT messageError req=%1 err=%2").arg(reqId).arg(err));
+            QVariantMap ref = m_threadPendingById.take(reqId);
+            if (ref.isEmpty()) return;
+            QString topic    = ref.value("topic").toString();
+            QString localId  = ref.value("localMsgId").toString();
+            QVariantList& buf = m_threadMessages[topic];
+            for (int i = 0; i < buf.size(); ++i) {
+                QVariantMap m = buf[i].toMap();
+                if (m.value("id").toString() == localId) {
+                    m["pending"] = false;
+                    m["failed"]  = true;
+                    buf[i] = m;
+                    emitThreadMessagesChanged(topic);
+                    break;
+                }
+            }
+        });
+
+    // messagePropagated: informational; pending flag is cleared by messageSent.
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("messagePropagated"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString reqId = evtStr(d, 0);
+            ybmDiag(QStringLiteral("EVT messagePropagated req=%1").arg(reqId));
+        });
+}
+
+void YoloBoardModule::initDelivery() {
+    // Only guard on readiness — m_deliveryStarting is pre-set in configure()
+    // so the UI can blink the icon from t=0 (otherwise there's a millisecond
+    // window where starting=false and the animation doesn't run).
+    if (m_deliveryReady) return;
+    if (!m_deliveryClient) {
+        if (!logosAPI) return;
+        m_deliveryClient = logosAPI->getClient(kDeliveryModuleName);
+        if (!m_deliveryClient) {
+            setStatus(QStringLiteral("Delivery client unavailable"));
+            return;
+        }
+        subscribeDeliveryEvents();
+    }
+
+    QString deliveryDir = m_dataDir + "/delivery";
+    QDir().mkpath(deliveryDir);
+
+    // Minimal Waku config. `preset: "logos.dev"` populates cluster ID,
+    // bootstrap peers, RLN etc for the default Logos dev network. If the
+    // user wants a specific network they can drop delivery-config.json in
+    // dataDir; we'll pick that up verbatim.
+    QJsonObject cfg;
+    // Core mode + relay: without relay the node is a filter/lightpush client
+    // and subscribe() waits for a peer that serves those protocols — the
+    // logos.dev entry nodes don't, so subscribe blocks its 30 s timeout and
+    // returns false. As a relay node we join the pubsub shard directly and
+    // messages flow as soon as any relay peer is dialed.
+    cfg["mode"] = "Core";
+    cfg["relay"] = true;
+    cfg["preset"] = "logos.dev";
+    cfg["logLevel"] = "INFO";
+    // Waku defaults (TCP 60000 / UDP 9000) commonly collide with other
+    // developer tooling (VS Code code-tunnel grabs 60000, various local
+    // services want 9000), causing START_NODE to fail with "Address
+    // already in use". Pick non-default ports and let the user override
+    // via delivery-config.json if they need something specific.
+    // Allow per-instance port override via env vars so two Basecamps on
+    // one host (same machine, separate XDG profiles) can both bring up
+    // Waku nodes. Defaults pick up the "safe" 61000/9009 slot we settled
+    // on vs the collision-prone 60000/9000 defaults. Upstream has this
+    // tracked as logos-delivery-module#18.
+    int tcpPort = qEnvironmentVariableIntValue("YOLO_DELIVERY_TCP_PORT");
+    if (tcpPort == 0) tcpPort = 61000;
+    int udpPort = qEnvironmentVariableIntValue("YOLO_DELIVERY_DISCV5_UDP_PORT");
+    if (udpPort == 0) udpPort = 9009;
+    cfg["tcpPort"] = tcpPort;
+    cfg["discv5UdpPort"] = udpPort;
+    ybmDiag(QStringLiteral("initDelivery: ports tcp=%1 udp=%2").arg(tcpPort).arg(udpPort));
+    {
+        QFile override(m_dataDir + "/delivery-config.json");
+        if (override.open(QIODevice::ReadOnly)) {
+            QJsonDocument od = QJsonDocument::fromJson(override.readAll());
+            if (od.isObject()) cfg = od.object();
+        }
+    }
+    QString cfgJson = QString::fromUtf8(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
+
+    // Default QRO client timeout is 20s. delivery_module's createNode
+    // spins up a Waku node (bearssl init, libp2p, rendezvous bootstrap)
+    // and routinely takes 20–40s; start() is similar. Bump to 90s so the
+    // sync reply actually reaches us instead of timing out client-side.
+    // (The module's own CALLBACK_TIMEOUT is 30s, so we're still bounded.)
+    Timeout deliveryTimeout{90000};
+    ybmDiag(QStringLiteral("initDelivery: using Timeout.ms=%1").arg(deliveryTimeout.ms));
+
+    ybmDiag(QStringLiteral("initDelivery: calling createNode()"));
+    bool okCreate = deliveryBoolResult(m_deliveryClient->invokeRemoteMethod(
+        kDeliveryModuleName, QStringLiteral("createNode"),
+        QVariantList{ QVariant(cfgJson) }, deliveryTimeout));
+    ybmDiag(QStringLiteral("initDelivery: createNode() ok=%1").arg(okCreate));
+    if (!okCreate) {
+        m_deliveryStarting = false;
+        setStatus(QStringLiteral("Delivery init failed"));
+        emitStateChanged();
+        return;
+    }
+
+    ybmDiag(QStringLiteral("initDelivery: calling start()"));
+    bool okStart = deliveryBoolResult(m_deliveryClient->invokeRemoteMethod(
+        kDeliveryModuleName, QStringLiteral("start"),
+        QVariantList{}, deliveryTimeout));
+    ybmDiag(QStringLiteral("initDelivery: start() ok=%1").arg(okStart));
+    if (!okStart) {
+        m_deliveryStarting = false;
+        setStatus(QStringLiteral("Delivery start failed"));
+        emitStateChanged();
+        return;
+    }
+    // Prefer the connectionStateChanged event to flip ready. Fall back to
+    // polled-ready in case the event never fires (same pattern storage uses).
+    if (!m_deliveryReady) {
+        m_deliveryReady = true;
+        m_deliveryStarting = false;
+        ybmDiag(QStringLiteral("initDelivery: m_deliveryReady=true (polled)"));
+        emitStateChanged();
+    }
+}
+
+QString YoloBoardModule::threadContentTopic(const QString& parentChannelId,
+                                            const QString& parentMsgId) {
+    QByteArray src;
+    src += QByteArrayLiteral("yolo:thread:v1");
+    src += char(0);
+    src += parentChannelId.toUtf8();
+    src += char(0);
+    src += parentMsgId.toUtf8();
+    QByteArray h = QCryptographicHash::hash(src, QCryptographicHash::Sha256);
+    // Keep the topic short: 16 bytes of the hash is 2⁻⁶⁴ collision, plenty
+    // for a per-message room. Matches the chat_module /app/ver/room/encoding
+    // convention so any Waku-aware tooling recognises it.
+    return QStringLiteral("/yolo/1/thread-%1/proto")
+               .arg(QString::fromLatin1(h.left(16).toHex()));
+}
+
+void YoloBoardModule::onThreadMessageReceived(const QString& topic,
+                                              const QString& payloadB64,
+                                              quint64 tsNs) {
+    if (!m_activeThreads.contains(topic)) return;  // not listening anymore
+
+    QByteArray raw = QByteArray::fromBase64(payloadB64.toUtf8());
+    QJsonDocument doc = QJsonDocument::fromJson(raw);
+    if (!doc.isObject()) {
+        ybmDiag(QStringLiteral("thread msg: non-JSON payload on %1").arg(topic));
+        return;
+    }
+    QJsonObject obj = doc.object();
+
+    QString localId = obj.value("id").toString(
+        QUuid::createUuid().toString(QUuid::WithoutBraces));
+
+    QVariantList& buf = m_threadMessages[topic];
+    // If this is our own message echoed back through the relay, the id matches
+    // an existing local entry — flip `confirmed` so the UI can show the
+    // "delivered ✓" indicator (proves the relay accepted + propagated us).
+    for (int i = 0; i < buf.size(); ++i) {
+        QVariantMap m = buf[i].toMap();
+        if (m.value("id").toString() == localId) {
+            if (!m.value("confirmed").toBool()) {
+                m["confirmed"] = true;
+                buf[i] = m;
+                emitThreadMessagesChanged(topic);
+                saveThreadMessages(topic);
+            }
+            return;
+        }
+    }
+
+    QVariantMap msg;
+    msg["id"]        = localId;
+    msg["text"]      = obj.value("text").toString();
+    msg["nick"]      = obj.value("nick").toString();
+    msg["ts"]        = qulonglong(obj.value("ts").toVariant().toULongLong());
+    msg["receivedAt"] = qulonglong(tsNs);
+    msg["isOwn"]     = false;
+    msg["pending"]   = false;
+    msg["failed"]    = false;
+    msg["confirmed"] = true;  // arrived from network = network-confirmed
+
+    buf.append(msg);
+    while (buf.size() > kMaxThreadMsgs) buf.removeFirst();
+    emitThreadMessagesChanged(topic);
+    saveThreadMessages(topic);
+}
+
+// ── Participated threads persistence ─────────────────────────────────────────
+
+QString YoloBoardModule::participatedThreadsPath() const {
+    if (m_dataDir.isEmpty()) return {};
+    return m_dataDir + "/participated-threads.json";
+}
+
+// ── Thread message cache ─────────────────────────────────────────────────────
+
+QString YoloBoardModule::threadMessagesPath(const QString& topic) const {
+    if (m_dataDir.isEmpty()) return {};
+    // Waku topics look like `/yolo/1/thread-<hex>/proto`; hash to a fixed-length
+    // filename to dodge path-separator issues and filesystem name limits.
+    QByteArray h = QCryptographicHash::hash(topic.toUtf8(),
+                                            QCryptographicHash::Sha256);
+    return m_dataDir + "/threads/" + QString::fromLatin1(h.left(16).toHex()) + ".json";
+}
+
+void YoloBoardModule::loadThreadMessages(const QString& topic) {
+    QString path = threadMessagesPath(topic);
+    if (path.isEmpty()) return;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return;
+    QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+    if (!doc.isArray()) return;
+    QVariantList list;
+    for (const QJsonValue& v : doc.array()) {
+        if (v.isObject()) list.append(v.toObject().toVariantMap());
+    }
+    m_threadMessages.insert(topic, list);
+}
+
+void YoloBoardModule::saveThreadMessages(const QString& topic) {
+    QString path = threadMessagesPath(topic);
+    if (path.isEmpty()) return;
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QJsonArray arr;
+    for (const QVariant& v : m_threadMessages.value(topic)) {
+        // Skip still-pending messages — they'll re-appear via the relay echo
+        // once confirmed, and persisting them would leave ghost entries if
+        // the app crashed before the echo landed.
+        QVariantMap m = v.toMap();
+        if (m.value("pending").toBool()) continue;
+        arr.append(QJsonObject::fromVariantMap(m));
+    }
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void YoloBoardModule::loadParticipatedThreads() {
+    QString path = participatedThreadsPath();
+    if (path.isEmpty()) {
+        // dataDir not set yet — defer until configure runs.
+        return;
+    }
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return;
+    QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+    if (!doc.isArray()) return;
+    m_participatedThreads.clear();
+    for (const QJsonValue& v : doc.array()) {
+        if (v.isObject()) m_participatedThreads.append(v.toObject().toVariantMap());
+    }
+}
+
+void YoloBoardModule::saveParticipatedThreads() {
+    QString path = participatedThreadsPath();
+    if (path.isEmpty()) return;
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QJsonArray arr;
+    for (const QVariant& v : m_participatedThreads) {
+        arr.append(QJsonObject::fromVariantMap(v.toMap()));
+    }
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void YoloBoardModule::recordParticipation(const QString& threadTopic,
+                                          const QString& parentChannelId,
+                                          const QString& parentMsgId) {
+    qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    for (int i = 0; i < m_participatedThreads.size(); ++i) {
+        QVariantMap m = m_participatedThreads[i].toMap();
+        if (m.value("threadTopic").toString() == threadTopic) {
+            m["lastSeenMs"] = qlonglong(nowMs);
+            m_participatedThreads[i] = m;
+            saveParticipatedThreads();
+            return;
+        }
+    }
+    // Best-effort parent preview from in-memory cache.
+    QString preview;
+    const QVariantList& parentMsgs = m_allMessages.value(parentChannelId);
+    for (const QVariant& v : parentMsgs) {
+        QVariantMap m = v.toMap();
+        if (m.value("id").toString() == parentMsgId) {
+            preview = m.value("displayText").toString();
+            if (preview.isEmpty()) preview = m.value("data").toString();
+            if (preview.size() > 80) preview = preview.left(80) + "…";
+            break;
+        }
+    }
+
+    QVariantMap entry;
+    entry["threadTopic"]     = threadTopic;
+    entry["parentChannelId"] = parentChannelId;
+    entry["parentMsgId"]     = parentMsgId;
+    entry["parentPreview"]   = preview;
+    entry["firstSeenMs"]     = qlonglong(nowMs);
+    entry["lastSeenMs"]      = qlonglong(nowMs);
+    m_participatedThreads.append(entry);
+    saveParticipatedThreads();
+}
+
+// ── Public API: threads ──────────────────────────────────────────────────────
+
+QString YoloBoardModule::open_thread(const QString& parentChannelId,
+                                     const QString& parentMsgId) {
+    if (parentChannelId.isEmpty() || parentMsgId.isEmpty())
+        return QStringLiteral("Error: missing parent ids");
+    QString topic = threadContentTopic(parentChannelId, parentMsgId);
+    if (!m_deliveryClient) return QStringLiteral("Error: delivery unavailable");
+    if (!m_deliveryReady) {
+        // Caller can retry after connectionStateChanged.
+        return QString();
+    }
+    // Defer the subscribe dispatch via a zero-delay singleShot so open_thread
+    // returns to the caller instantly. The async flavour of invokeRemoteMethod
+    // still runs `requestObject → waitForSource` synchronously on cold
+    // replicas, which can block ~20 s on the first call for a given module —
+    // that'd wedge open_thread's own Q_INVOKABLE reply and users see the
+    // panel freeze before opening.
+    // Track subscribed state so the UI can clear its "Connecting…" hint
+    // on ack rather than waiting for the first message (empty threads are
+    // legitimate; the indicator should only reflect subscribe success).
+    m_threadSubscribed.insert(topic, false);
+    ybmDiag(QStringLiteral("open_thread: dispatching subscribe topic=%1").arg(topic));
+    LogosAPIClient* deliveryClient = m_deliveryClient;
+    QPointer<YoloBoardModule> self(this);
+    QTimer::singleShot(0, this, [deliveryClient, topic, self]() {
+        deliveryClient->invokeRemoteMethodAsync(
+            kDeliveryModuleName, QStringLiteral("subscribe"),
+            QVariantList{ QVariant(topic) },
+            [topic, self](const QVariant& r) {
+                bool ok = r.canConvert<LogosResult>() && r.value<LogosResult>().success;
+                ybmDiag(QStringLiteral("open_thread: subscribe done topic=%1 ok=%2").arg(topic).arg(ok));
+                if (!self) return;
+                if (ok) self->m_threadSubscribed.insert(topic, true);
+                self->emitThreadMessagesChanged(topic);  // nudge UI to poll
+            },
+            Timeout{60000});
+    });
+
+    QVariantMap meta;
+    meta["parentChannelId"] = parentChannelId;
+    meta["parentMsgId"]     = parentMsgId;
+    m_activeThreads.insert(topic, meta);
+    // Restore persisted history before the first subscribe event lands.
+    // loadThreadMessages is a no-op if the cache file doesn't exist yet.
+    if (!m_threadMessages.contains(topic)) {
+        loadThreadMessages(topic);
+        if (!m_threadMessages.contains(topic)) m_threadMessages.insert(topic, {});
+    }
+
+    recordParticipation(topic, parentChannelId, parentMsgId);
+    emitThreadMessagesChanged(topic);
+    return topic;
+}
+
+void YoloBoardModule::close_thread(const QString& topic) {
+    if (!m_activeThreads.contains(topic)) return;
+    m_threadSubscribed.remove(topic);
+    if (m_deliveryClient) {
+        // Defer via singleShot so close_thread returns instantly (same
+        // cold-replica latency concern as subscribe — see open_thread).
+        LogosAPIClient* deliveryClient = m_deliveryClient;
+        QTimer::singleShot(0, this, [deliveryClient, topic]() {
+            deliveryClient->invokeRemoteMethodAsync(
+                kDeliveryModuleName, QStringLiteral("unsubscribe"),
+                QVariantList{ QVariant(topic) },
+                [](const QVariant&) {},
+                Timeout{60000});
+        });
+    }
+    m_activeThreads.remove(topic);
+    // NOTE: keep m_threadMessages[topic] populated so closing + reopening
+    // the same thread restores history instantly. The buffer is bounded by
+    // kMaxThreadMsgs anyway. Cross-session persistence would be a further
+    // step (write to disk on close + reload on open_thread).
+    // Purge any pending id → topic refs so stale messageSent/Error callbacks
+    // for this room don't reach into maps that no longer exist.
+    for (auto it = m_threadPendingById.begin(); it != m_threadPendingById.end(); ) {
+        if (it.value().value("topic").toString() == topic)
+            it = m_threadPendingById.erase(it);
+        else
+            ++it;
+    }
+}
+
+QString YoloBoardModule::publish_thread_reply(const QString& topic,
+                                              const QString& text) {
+    if (text.trimmed().isEmpty()) return QStringLiteral("Error: empty message");
+    if (!m_activeThreads.contains(topic))
+        return QStringLiteral("Error: thread not open");
+    if (!m_deliveryClient || !m_deliveryReady)
+        return QStringLiteral("Error: delivery not ready");
+
+    QString localId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // Use the human-readable channel name as the nick. Every yolo channel
+    // id starts with hex of "logos:y…" → truncating the first 8 hex chars
+    // always yields "6c6f676f", so every nick collapses to the same string.
+    // `channelDisplayName` decodes the channel name back out of the padded
+    // bytes (e.g. "bar", "bob") — fine for a stand-in identity until we
+    // wire proper signed payloads.
+    QString nick = channelDisplayName(m_ownChannelId);
+    qint64  nowMs   = QDateTime::currentMSecsSinceEpoch();
+
+    // Optimistic append — UI shows it instantly.
+    QVariantMap msg;
+    msg["id"]      = localId;
+    msg["text"]    = text;
+    msg["nick"]    = nick;
+    msg["ts"]      = qlonglong(nowMs);
+    msg["isOwn"]   = true;
+    msg["pending"] = true;
+    msg["failed"]  = false;
+    m_threadMessages[topic].append(msg);
+    while (m_threadMessages[topic].size() > kMaxThreadMsgs)
+        m_threadMessages[topic].removeFirst();
+    emitThreadMessagesChanged(topic);
+
+    // Build payload and ship it. Delivery module base64-encodes the QString
+    // payload internally before crossing the FFI boundary.
+    QJsonObject payload;
+    payload["v"]    = 1;
+    payload["id"]   = localId;
+    payload["text"] = text;
+    payload["nick"] = nick;
+    payload["ts"]   = qlonglong(nowMs);
+    QString payloadStr = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+
+    // Defer via singleShot so publish_thread_reply returns instantly — see
+    // open_thread for the cold-replica latency rationale. The reply callback
+    // fires on main thread when the ~20 s Waku round-trip completes.
+    ybmDiag(QStringLiteral("publish_thread_reply: dispatching send topic=%1 localId=%2")
+                .arg(topic).arg(localId));
+    QPointer<YoloBoardModule> self(this);
+    LogosAPIClient* deliveryClient = m_deliveryClient;
+    QTimer::singleShot(0, this, [deliveryClient, topic, payloadStr, localId, self]() {
+      deliveryClient->invokeRemoteMethodAsync(
+        kDeliveryModuleName, QStringLiteral("send"),
+        QVariantList{ QVariant(topic), QVariant(payloadStr) },
+        [self, topic, localId](const QVariant& raw) {
+            if (!self) return;
+            bool    ok    = raw.canConvert<LogosResult>() && raw.value<LogosResult>().success;
+            QString reqId = raw.canConvert<LogosResult>()
+                                ? raw.value<LogosResult>().value.toString()
+                                : QString();
+            ybmDiag(QStringLiteral("publish_thread_reply: send done topic=%1 ok=%2 reqId=%3")
+                        .arg(topic).arg(ok).arg(reqId));
+            QVariantList& buf = self->m_threadMessages[topic];
+            for (int i = 0; i < buf.size(); ++i) {
+                QVariantMap m = buf[i].toMap();
+                if (m.value("id").toString() != localId) continue;
+                // send() already blocks until propagation (CALLBACK_TIMEOUT on
+                // delivery's side), so when we get here with ok=1 the network
+                // has already accepted the message. Flip pending=false now
+                // instead of waiting another ~5 s for the messageSent event —
+                // the user shouldn't see "sending" after the round-trip
+                // already completed.
+                m["pending"] = false;
+                m["failed"]  = !ok;
+                buf[i] = m;
+                break;
+            }
+            self->emitThreadMessagesChanged(topic);
+            if (ok && !reqId.isEmpty()) {
+                QVariantMap ref;
+                ref["topic"]      = topic;
+                ref["localMsgId"] = localId;
+                self->m_threadPendingById.insert(reqId, ref);
+            }
+        },
+        Timeout{60000});
+    });
+    return localId;
+}
+
+QString YoloBoardModule::get_thread_messages(const QString& topic) {
+    QJsonArray arr;
+    for (const QVariant& v : m_threadMessages.value(topic)) {
+        arr.append(QJsonObject::fromVariantMap(v.toMap()));
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+QString YoloBoardModule::get_participated_threads() {
+    QJsonArray arr;
+    for (const QVariant& v : m_participatedThreads) {
+        arr.append(QJsonObject::fromVariantMap(v.toMap()));
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+QString YoloBoardModule::is_thread_subscribed(const QString& topic) {
+    return m_threadSubscribed.value(topic, false) ? QStringLiteral("true")
+                                                  : QStringLiteral("false");
+}
+
+// ── Public API: configure ────────────────────────────────────────────────────
+
+QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUrl) {
+    QString expanded = dataDir;
+    if (expanded.startsWith("~/"))
+        expanded = QDir::homePath() + expanded.mid(1);
+
+    QDir dir(expanded);
+    if (!dir.exists()) return "Error: directory does not exist: " + expanded;
+
+    // Idempotent: if we're already configured with these exact values, or
+    // configure is mid-flight, don't kick off another round. storage_module's
+    // init() is not idempotent — a second call with an already-initialized
+    // context fails with "Failed to create Storage", and two concurrent
+    // initSequencer calls also race.
+    if (m_configuring) {
+        ybmDiag(QStringLiteral("configure: already configuring; skipping"));
+        return QStringLiteral("configuring");
+    }
+    if (m_connected && m_dataDir == expanded && m_nodeUrl == nodeUrl) {
+        ybmDiag(QStringLiteral("configure: already connected with same args; skipping"));
+        return QStringLiteral("already connected");
+    }
+
+    m_dataDir = expanded;
+    m_nodeUrl = nodeUrl;
+
+    if (!loadKeyFromFile()) return "Error: cannot read sequencer.key in " + expanded;
+    loadChannelFromFile();  // optional — can be derived
+
+    m_configuring = true;
+    m_sequencerStarting = true;
+    m_storageStarting   = true;
+    m_deliveryStarting  = true;
+    setStatus("Connecting & starting storage\u2026");
+
+    // Pre-load cached messages off disk BEFORE the 40-60 s sequencer init.
+    // If we know our channel id from channel.id on disk, we can render cached
+    // channels + messages immediately — user sees content in <1 s instead of
+    // staring at an empty board for a minute. The sequencer catches up later
+    // via the poll timer once it's connected.
+    if (!m_ownChannelId.isEmpty()) {
+        if (!m_channelIds.contains(m_ownChannelId))
+            m_channelIds.prepend(m_ownChannelId);
+        loadCacheForChannel(m_ownChannelId);
+        loadSubscriptions();  // also populates caches for subscribed channels
+        emitChannelsChanged();
+        emitMessagesChanged(m_ownChannelId);
+    }
+
+    emitStateChanged();
+
+    // Init order matters for startup time. Previously all three
+    // inits fired in parallel via back-to-back singleShot(0), but that
+    // made yolo_board's FIRST QRO call to zone-sequencer race the
+    // zone-sequencer host's QRO-source registration and cost ~85s waiting
+    // for the source. Delivery's sync createNode (~24s) burns the main
+    // thread in a nested event loop during that wait, so zone-sequencer
+    // never gets air until delivery finishes.
+    //
+    // Fix: serialize delivery → sequencer. Storage stays parallel (no
+    // contention with zone-seq). By the time we fire initSequencer,
+    // delivery has finished its nested-loop blockade, zone-sequencer's
+    // QRO source is already registered, and set_node_url returns in ms
+    // instead of 85s. Load_from_directory's ~20s of real work is
+    // unchanged — that's actual chain-state reconstruction, not warm-up.
+
+    // Storage in parallel with delivery — they don't contend.
+    QTimer::singleShot(0, this, [this]() {
+        ybmDiag(QStringLiteral("configure: initStorage begin"));
+        initStorage();
+        m_storageStarting = false;
+        ybmDiag(QStringLiteral("configure: initStorage done storageReady=%1").arg(m_storageReady));
+        if (m_connected) {
+            setStatus(QStringLiteral("Connected to ") + m_nodeUrl);
+        }
+        if (!m_sequencerStarting) m_configuring = false;
+        emitStateChanged();
+    });
+
+    // Delivery first — then sequencer runs after it so zone-seq's QRO
+    // source has had the full delivery-init window to come up.
+    QTimer::singleShot(0, this, [this]() {
+        ybmDiag(QStringLiteral("configure: initDelivery begin"));
+        initDelivery();
+        ybmDiag(QStringLiteral("configure: initDelivery done deliveryReady=%1").arg(m_deliveryReady));
+        emitStateChanged();
+
+        // Now that delivery is done blocking the main thread, zone-seq
+        // should have published its QRO source. Fire initSequencer via
+        // a fresh singleShot so any pending events drain first.
+        QTimer::singleShot(0, this, [this]() {
+            ybmDiag(QStringLiteral("configure: initSequencer begin"));
+            initSequencer();
+            m_sequencerStarting = false;
+            ybmDiag(QStringLiteral("configure: initSequencer done ownChannel=%1").arg(m_ownChannelId));
+
+            if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
+                setStatus("Error: could not determine channel ID");
+                if (!m_storageStarting) m_configuring = false;
+                emitStateChanged();
+                return;
+            }
+
+            if (!m_channelIds.contains(m_ownChannelId))
+                m_channelIds.prepend(m_ownChannelId);
+            if (!m_allMessages.contains(m_ownChannelId))
+                loadCacheForChannel(m_ownChannelId);
+            if (m_channelIds.size() <= 1)
+                loadSubscriptions();
+
+            m_connected = true;
+            setStatus(m_storageReady
+                          ? QStringLiteral("Connected to ") + m_nodeUrl
+                          : QStringLiteral("Sequencer connected; storage starting…"));
+
+            QJsonObject cfg;
+            cfg["dataDir"] = m_dataDir;
+            cfg["nodeUrl"] = m_nodeUrl;
+            QFile f(uiConfigPath());
+            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                f.write(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
+
+            m_pollTimer->start();
+            emitChannelsChanged();
+            if (!m_storageStarting) m_configuring = false;
+            emitStateChanged();
+        });
+    });
+
+    // Now that dataDir is known, (re)load persisted participated-threads
+    // list. initLogos may have skipped this if dataDir wasn't set yet.
+    loadParticipatedThreads();
+
+    return "pending";
+}
+
+// ── Public API: state snapshots ──────────────────────────────────────────────
+
+QString YoloBoardModule::get_state() {
+    // Lazy refresh: the first refreshStorageInfo() right after storageStart
+    // sometimes gets empty strings back because the storage node is still
+    // settling (peer id / SPR get published a few hundred ms after the event
+    // fires). Retry on every get_state poll until we have real data.
+    if (m_storage && m_storageReady && m_storagePeerId.isEmpty()) {
+        refreshStorageInfo();
+    }
+    QJsonObject state;
+    state["connected"] = m_connected;
+    state["storageReady"] = m_storageReady;
+    state["deliveryReady"] = m_deliveryReady;
+    state["sequencerStarting"] = m_sequencerStarting;
+    state["storageStarting"]   = m_storageStarting;
+    state["deliveryStarting"]  = m_deliveryStarting;
+    state["uploading"] = m_uploading;
+    state["status"] = m_status;
+    state["ownChannelId"] = m_ownChannelId;
+    state["ownChannelName"] = channelDisplayName(m_ownChannelId);
+    state["nodeUrl"] = m_nodeUrl;
+    state["dataDir"] = m_dataDir;
+    state["savedPeerId"] = m_savedPeerId;
+    state["savedPeerAddrs"] = m_savedPeerAddrs;
+
+    // Storage node identity (for port-forwarding / SPR sharing).
+    state["storagePeerId"]     = m_storagePeerId;
+    state["storageSpr"]        = m_storageSpr;
+    state["storageListenAddrs"]   = QJsonArray::fromStringList(m_storageListenAddrs);
+    state["storageAnnounceAddrs"] = QJsonArray::fromStringList(m_storageAnnounceAddrs);
+
+    QJsonArray channels;
+    for (const QString& id : m_channelIds) {
+        QJsonObject ch;
+        ch["id"] = id;
+        ch["name"] = channelDisplayName(id);
+        ch["isOwn"] = (id == m_ownChannelId);
+        ch["unread"] = m_unreadCounts.value(id, 0);
+        channels.append(ch);
+    }
+    state["channels"] = channels;
+
+    QJsonObject backfillProgress;
+    for (auto it = m_backfillSlots.constBegin(); it != m_backfillSlots.constEnd(); ++it) {
+        quint64 cs = it.value().first;
+        quint64 ls = it.value().second;
+        double p = (ls > 0) ? qMin(1.0, double(cs) / double(ls)) : 0.0;
+        backfillProgress[it.key()] = p;
+    }
+    state["backfillProgress"] = backfillProgress;
+
+    return QString::fromUtf8(QJsonDocument(state).toJson(QJsonDocument::Compact));
+}
+
+QString YoloBoardModule::get_messages(const QString& channelId) {
+    QJsonArray arr;
+    for (const QVariant& v : m_allMessages.value(channelId)) {
+        QVariantMap m = v.toMap();
+        QJsonObject obj;
+        obj["id"] = m["id"].toString();
+        obj["data"] = m["data"].toString();
+        obj["displayText"] = m["displayText"].toString();
+        obj["channel"] = m["channel"].toString();
+        obj["isOwn"] = m["isOwn"].toBool();
+        obj["timestamp"] = m["timestamp"].toString();
+        obj["pending"] = m["pending"].toBool();
+        obj["failed"] = m["failed"].toBool();
+        QJsonArray mediaArr;
+        for (const QVariant& mv : m["media"].toList()) {
+            QVariantMap mm = mv.toMap();
+            QJsonObject me;
+            me["cid"]  = mm["cid"].toString();
+            me["type"] = mm["type"].toString();
+            me["name"] = mm["name"].toString();
+            me["size"] = mm["size"].toInt();
+            mediaArr.append(me);
+        }
+        obj["media"] = mediaArr;
+        arr.append(obj);
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+QString YoloBoardModule::get_channels() {
+    QJsonArray arr;
+    for (const QString& id : m_channelIds) {
+        QJsonObject ch;
+        ch["id"] = id;
+        ch["name"] = channelDisplayName(id);
+        ch["isOwn"] = (id == m_ownChannelId);
+        ch["unread"] = m_unreadCounts.value(id, 0);
+        arr.append(ch);
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+// ── Public API: channels ─────────────────────────────────────────────────────
+
+QString YoloBoardModule::subscribe(const QString& input) {
+    QString channelId = input.trimmed();
+    if (channelId.isEmpty()) return "Error: empty input";
+
+    static const QRegularExpression hexRe("^[0-9a-fA-F]{64}$");
+    if (!hexRe.match(channelId).hasMatch()) {
+        QString encoded = encodeChannelName(channelId);
+        if (encoded.isEmpty()) return "Error: name too long";
+        channelId = encoded;
+    }
+
+    if (m_channelIds.contains(channelId)) return "Error: already subscribed";
+
+    m_channelIds.append(channelId);
+    m_unreadCounts[channelId] = 0;
+    saveSubscriptions();
+    loadCacheForChannel(channelId);
+    emitChannelsChanged();
+    emitMessagesChanged(channelId);
+
+    setStatus("Subscribed to " + channelDisplayName(channelId));
+    // Defer the initial fetch so subscribe() returns to QML instantly.
+    // fetchMessages runs a sync zoneCall("query_channel", …) that blocks
+    // the main thread for a few seconds; if the user hits "Publish" during
+    // that window, the publish's own singleShot queues but can't drain
+    // until the fetch returns (nested QRO sync calls on the same replica
+    // serialize). Deferring puts the fetch on the next event-loop tick —
+    // subscribe() comes back immediately, the periodic poll timer will
+    // also catch up to this channel within kPollIntervalMs regardless.
+    QTimer::singleShot(0, this, [this, channelId]() {
+        fetchMessages(channelId);
+    });
+    return channelId;
+}
+
+QString YoloBoardModule::unsubscribe(const QString& channelId) {
+    if (!m_channelIds.contains(channelId)) return "Error: not subscribed";
+    if (channelId == m_ownChannelId) return "Error: cannot unsubscribe from own channel";
+
+    m_channelIds.removeAll(channelId);
+    m_allMessages.remove(channelId);
+    m_unreadCounts.remove(channelId);
+    saveSubscriptions();
+    emitChannelsChanged();
+    return "ok";
+}
+
+void YoloBoardModule::clear_unread(const QString& channelId) {
+    if (m_unreadCounts.value(channelId, 0) > 0) {
+        m_unreadCounts[channelId] = 0;
+        emitChannelsChanged();
+    }
+}
+
+// ── Public API: publish ──────────────────────────────────────────────────────
+
+QString YoloBoardModule::publish(const QString& text) {
+    if (text.trimmed().isEmpty()) return "Error: empty message";
+    if (!m_connected) return "Error: not connected";
+
+    // Optimistic pending message
+    QString pendingId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QVariantMap pendingMsg;
+    pendingMsg["id"]        = pendingId;
+    pendingMsg["data"]      = text;
+    pendingMsg["channel"]   = m_ownChannelId;
+    pendingMsg["isOwn"]     = true;
+    pendingMsg["timestamp"] = QDateTime::currentDateTime().toString("HH:mm:ss");
+    pendingMsg["pending"]   = true;
+    pendingMsg["failed"]    = false;
+    QVariantMap parsed = parseMessagePayload(text);
+    pendingMsg["displayText"] = parsed["text"];
+    pendingMsg["media"]       = parsed["media"];
+    m_allMessages[m_ownChannelId].append(pendingMsg);
+    emitMessagesChanged(m_ownChannelId);
+
+    // Defer publish to next event loop iteration on main thread.
+    // QRemoteObjects is thread-bound; calling zoneCall from a background
+    // thread would silently fail.
+    QTimer::singleShot(0, this, [this, text, pendingId]() {
+        QString result = zoneCall("publish", {text}).toString();
+        bool ok = !result.isEmpty() && !result.startsWith("Error:");
+
+        QVariantList& msgs = m_allMessages[m_ownChannelId];
+        for (int i = 0; i < msgs.size(); ++i) {
+            QVariantMap m = msgs[i].toMap();
+            if (m["id"].toString() == pendingId) {
+                m["pending"] = false;
+                m["failed"]  = !ok;
+                if (ok) m["id"] = result;
+                msgs[i] = m;
+                break;
+            }
+        }
+        emitMessagesChanged(m_ownChannelId);
+        setStatus(ok ? "Published: " + result.left(12) + QStringLiteral("\u2026")
+                     : "Publish failed: " + result);
+        saveCacheForChannel(m_ownChannelId);
+    });
+
+    return pendingId;
+}
+
+QString YoloBoardModule::publish_with_attachment(const QString& text, const QString& filePath) {
+    qInfo() << "YoloBoardModule: publish_with_attachment called text=" << text << "path=" << filePath << "storageReady=" << m_storageReady;
+    QString expanded = filePath;
+    if (expanded.startsWith("~/"))
+        expanded = QDir::homePath() + expanded.mid(1);
+
+    QFileInfo fi(expanded);
+    if (!fi.exists()) {
+        qWarning() << "publish_with_attachment: file not found" << expanded;
+        return "Error: file not found: " + expanded;
+    }
+
+    QString pendingId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    // Optimistic pending message — added immediately so the user gets
+    // visual feedback even if storage isn't ready yet (start can take 20-30s).
+    QVariantMap pendingMsg;
+    pendingMsg["id"]        = pendingId;
+    pendingMsg["data"]      = text.isEmpty() ? (QStringLiteral("[image] ") + fi.fileName()) : text;
+    pendingMsg["channel"]   = m_ownChannelId;
+    pendingMsg["isOwn"]     = true;
+    pendingMsg["timestamp"] = QDateTime::currentDateTime().toString("HH:mm:ss");
+    pendingMsg["pending"]   = true;
+    pendingMsg["failed"]    = false;
+    pendingMsg["displayText"] = text;
+    QVariantMap mediaPlaceholder;
+    mediaPlaceholder["cid"]  = "uploading";
+    mediaPlaceholder["type"] = "image/png";
+    mediaPlaceholder["name"] = fi.fileName();
+    mediaPlaceholder["size"] = (int)fi.size();
+    pendingMsg["media"]     = QVariantList{mediaPlaceholder};
+    m_allMessages[m_ownChannelId].append(pendingMsg);
+    emitMessagesChanged(m_ownChannelId);
+
+    m_uploading = true;
+    if (!m_storageReady) {
+        setStatus("Waiting for storage to start\u2026");
+    } else {
+        setStatus("Uploading " + fi.fileName() + QStringLiteral("\u2026"));
+    }
+    emitStateChanged();
+
+    // Defer to main thread; if storage isn't ready, runUpload retries until it is.
+    QTimer::singleShot(0, this, [this, text, expanded, pendingId]() {
+        startUploadWhenReady(text, expanded, pendingId);
+    });
+
+    return pendingId;
+}
+
+void YoloBoardModule::startUploadWhenReady(const QString& text, const QString& filePath,
+                                            const QString& pendingMsgId) {
+    if (!m_storageReady) {
+        QTimer::singleShot(1000, this, [this, text, filePath, pendingMsgId]() {
+            startUploadWhenReady(text, filePath, pendingMsgId);
+        });
+        return;
+    }
+    QFileInfo fi(filePath);
+    setStatus("Uploading " + fi.fileName() + QStringLiteral("\u2026"));
+    emitStateChanged();
+    runUpload(text, filePath, pendingMsgId);
+}
+
+void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
+                                 const QString& pendingMsgId) {
+    qInfo() << "YoloBoardModule::runUpload starting" << filePath;
+    if (!m_storage) {
+        qWarning() << "runUpload: no storage wrapper";
+        m_uploading = false;
+        setStatus("Upload failed: storage not available");
+        emitStateChanged();
+        return;
+    }
+
+    QFileInfo fi(filePath);
+    QString fileName = fi.fileName();
+    QString ext = fi.suffix().toLower();
+    QString mimeType = "application/octet-stream";
+    if (ext == "png")                       mimeType = "image/png";
+    else if (ext == "jpg" || ext == "jpeg") mimeType = "image/jpeg";
+    else if (ext == "gif")                  mimeType = "image/gif";
+    else if (ext == "webp")                 mimeType = "image/webp";
+    int fileSize = fi.size();
+
+    // Newer storage_module only exposes typed methods returning LogosResult.
+    // ModuleProxy serializes LogosResult as a JSON string on the wire; the
+    // generated StorageModule wrapper's `.value<LogosResult>()` can't
+    // reconstruct it on the client side. Work around by calling uploadUrl
+    // through raw invokeRemoteMethod and parsing the JSON ourselves.
+    // Signature: `uploadUrl(const QUrl& url, int chunkSize)`.
+    // Typed SDK: the generated StorageModule wrapper unpacks LogosResult
+    // correctly for us. IMPORTANT: raw invokeRemoteMethod returns a QVariant
+    // holding a LogosResult (registered via qRegisterMetaType), but
+    // .toString() on that returns empty — so use the typed wrapper instead.
+    LogosResult r = m_storage->uploadUrl(
+        QVariant::fromValue(QUrl::fromLocalFile(filePath)), 65536);
+    ybmDiag(QStringLiteral("uploadUrl success=%1 valueType=%2 error=%3")
+                .arg(r.success).arg(r.value.typeName()).arg(r.error.toString()));
+    if (!r.success) {
+        QVariantList& msgs = m_allMessages[m_ownChannelId];
+        for (int i = 0; i < msgs.size(); ++i) {
+            QVariantMap m = msgs[i].toMap();
+            if (m["id"].toString() == pendingMsgId) {
+                m["pending"] = false; m["failed"] = true;
+                msgs[i] = m; break;
+            }
+        }
+        emitMessagesChanged(m_ownChannelId);
+        m_uploading = false;
+        setStatus("Upload rejected: " + r.error.toString());
+        emitStateChanged();
+        return;
+    }
+
+    QString sessionId = r.value.toString();
+    PendingUpload up;
+    up.text         = text;
+    up.filePath     = filePath;
+    up.fileName     = fileName;
+    up.mimeType     = mimeType;
+    up.fileSize     = fileSize;
+    up.pendingMsgId = pendingMsgId;
+    m_pendingUploads.insert(sessionId, up);
+    ybmDiag(QStringLiteral("runUpload accepted session=%1").arg(sessionId));
+
+    // Completion arrives via the storageUploadDone event (subscribed in
+    // subscribeStorageEvents). A safety timeout catches stuck uploads.
+    QTimer::singleShot(120000, this, [this, sessionId]() {
+        if (!m_pendingUploads.contains(sessionId)) return;  // already completed
+        ybmDiag(QStringLiteral("upload timeout session=%1").arg(sessionId));
+        PendingUpload up = m_pendingUploads.take(sessionId);
+        QVariantList& msgs = m_allMessages[m_ownChannelId];
+        for (int i = 0; i < msgs.size(); ++i) {
+            QVariantMap m = msgs[i].toMap();
+            if (m["id"].toString() == up.pendingMsgId) {
+                m["pending"] = false;
+                m["failed"] = true;
+                msgs[i] = m;
+                break;
+            }
+        }
+        emitMessagesChanged(m_ownChannelId);
+        m_uploading = false;
+        setStatus("Upload timed out");
+        emitStateChanged();
+    });
+}
+
+// ── Public API: media ────────────────────────────────────────────────────────
+
+QString YoloBoardModule::resolve_media(const QString& cid) {
+    QString path;
+    if (m_mediaPaths.contains(cid)) {
+        path = m_mediaPaths[cid];
+    } else {
+        path = mediaCachePath(cid);
+        if (path.isEmpty() || !QFile::exists(path))
+            return {};
+        m_mediaPaths[cid] = path;
+    }
+
+    // The QML plugin engine forbids both file:// outside its own dir and
+    // network access (so data: URLs also fail). Mirror the file into the
+    // QML plugin's directory if the UI told us where that is, and return
+    // the path so QML can load it as a regular file://.
+    if (!m_uiDir.isEmpty()) {
+        QString sub = m_uiDir + "/media";
+        QDir().mkpath(sub);
+        QString mirrored = sub + "/" + cid;
+        QFileInfo mi(mirrored);
+        // If symlink (from older builds) or stale, replace with a real copy
+        // — the QML sandbox resolves symlinks and refuses if the target is
+        // outside the allowed root.
+        if (mi.isSymLink() || !mi.exists()) {
+            QFile::remove(mirrored);
+            QFile::copy(path, mirrored);
+        }
+        return mirrored;
+    }
+    return path;
+}
+
+void YoloBoardModule::set_ui_dir(const QString& uiDir) {
+    QString d = uiDir;
+    if (d.startsWith("file://")) d = d.mid(7);
+    while (d.endsWith('/')) d.chop(1);
+    m_uiDir = d;
+    qInfo() << "YoloBoardModule: ui dir set to" << m_uiDir;
+}
+
+void YoloBoardModule::fetch_media(const QString& cid) {
+    if (cid.isEmpty()) return;
+    if (m_fetchingMedia.contains(cid)) return;
+    if (!resolve_media(cid).isEmpty()) {
+        emitMediaReady(cid, m_mediaPaths[cid]);
+        return;
+    }
+    if (!m_storageReady) return;
+
+    m_fetchingMedia.insert(cid);
+    QTimer::singleShot(0, this, [this, cid]() { runDownload(cid); });
+}
+
+void YoloBoardModule::runDownload(const QString& cid) {
+    if (!m_storage) {
+        qWarning() << "runDownload: no storage wrapper";
+        m_fetchingMedia.remove(cid);
+        return;
+    }
+    QString cachePath = mediaCachePath(cid);
+    if (cachePath.isEmpty()) {
+        m_fetchingMedia.remove(cid);
+        return;
+    }
+    QDir().mkpath(mediaCacheDir());
+
+    LogosResult dr = m_storage->downloadToUrl(
+        cid, QVariant::fromValue(QUrl::fromLocalFile(cachePath)), /*local=*/false);
+    ybmDiag(QStringLiteral("downloadToUrl cid=%1 success=%2 err=%3")
+                .arg(cid).arg(dr.success).arg(dr.error.toString()));
+    if (!dr.success) {
+        m_fetchingMedia.remove(cid);
+        return;
+    }
+    // Completion arrives via storageDownloadDone event. Safety timeout.
+    QTimer::singleShot(60000, this, [this, cid]() {
+        if (m_fetchingMedia.contains(cid)) {
+            ybmDiag(QStringLiteral("download timeout cid=%1").arg(cid));
+            m_fetchingMedia.remove(cid);
+        }
+    });
+}
+
+// ── Control ──────────────────────────────────────────────────────────────────
+
+void YoloBoardModule::reset_checkpoint() {
+    if (m_dataDir.isEmpty()) return;
+    QString path = m_dataDir + "/sequencer.checkpoint";
+    if (QFile::exists(path)) {
+        QFile::rename(path, path + ".bak");
+        setStatus("Checkpoint reset");
+    } else {
+        setStatus("No checkpoint to reset");
+    }
+}
+
+void YoloBoardModule::start_backfill(const QString& channelId) {
+    if (m_backfillCancelled.contains(channelId)) return;
+
+    // Cancel-marker lives on the main thread — no longer a thread-safety
+    // primitive, just a presence check for the stop path.
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    m_backfillCancelled[channelId] = cancelled;
+    m_backfillSlots[channelId] = {0, 1};
+    emitStateChanged();
+    ybmDiag(QStringLiteral("start_backfill channel=%1").arg(channelId));
+
+    // Main-thread chained-singleShot state machine. Worker threads were
+    // incompatible here — invokeRemoteMethod on a QRO client is bound to
+    // the thread that owns the replica (main), so a worker's waitForFinished
+    // would deadlock on a reply that's delivered to a queue it isn't
+    // draining. Each step does ONE sync zoneCall on the main thread, then
+    // reschedules itself via singleShot(200, …) until done or cancelled.
+    QTimer::singleShot(0, this, [this, channelId, cancelled]() {
+        stepBackfill(channelId, QString{}, cancelled);
+    });
+}
+
+void YoloBoardModule::stop_backfill(const QString& channelId) {
+    auto it = m_backfillCancelled.find(channelId);
+    if (it != m_backfillCancelled.end()) {
+        (*it)->store(true);
+        m_backfillCancelled.erase(it);
+    }
+    m_backfillSlots.remove(channelId);
+    emitStateChanged();
+    ybmDiag(QStringLiteral("stop_backfill channel=%1").arg(channelId));
+}
+
+void YoloBoardModule::stepBackfill(const QString& channelId,
+                                    const QString& cursorJson,
+                                    std::shared_ptr<std::atomic<bool>> cancelled) {
+    if (cancelled->load() || !m_alive->load()) return;
+    if (!m_zoneClient) return;
+
+    // Async zoneCall — each page takes tens of seconds server-side and we
+    // can't block the main thread, otherwise get_state polls from QML
+    // stall and the progress bar never animates. The callback fires on
+    // the main thread when the reply is delivered.
+    m_zoneClient->invokeRemoteMethodAsync(
+        kZoneModuleName, "query_channel_paged",
+        {channelId, cursorJson, kBackfillPageSize},
+        [this, channelId, cancelled](QVariant r) {
+            if (cancelled->load() || !m_alive->load()) return;
+            QString result = r.toString();
+            ybmDiag(QStringLiteral("backfill page channel=%1 bytes=%2")
+                        .arg(channelId).arg(result.size()));
+            if (result.isEmpty()) {
+                m_backfillCancelled.remove(channelId);
+                m_backfillSlots.remove(channelId);
+                emitStateChanged();
+                setStatus("Backfill: empty response for " + channelDisplayName(channelId));
+                return;
+            }
+
+            QJsonDocument doc = QJsonDocument::fromJson(result.toUtf8());
+            if (!doc.isObject()) {
+                m_backfillCancelled.remove(channelId);
+                m_backfillSlots.remove(channelId);
+                emitStateChanged();
+                return;
+            }
+            QJsonObject root = doc.object();
+
+            quint64 cs = (quint64)root["cursor_slot"].toDouble();
+            quint64 ls = (quint64)root["lib_slot"].toDouble();
+            bool done = root["done"].toBool(false);
+
+            m_backfillSlots[channelId] = {cs, ls};
+            emitStateChanged();
+
+            QJsonArray msgs = root["messages"].toArray();
+            if (!msgs.isEmpty()) {
+                QVariantList& existing = m_allMessages[channelId];
+                QSet<QString> seenIds;
+                for (const QVariant& v : existing)
+                    seenIds.insert(v.toMap().value("id").toString());
+
+                QVariantList prepend;
+                for (const QJsonValue& val : msgs) {
+                    QJsonObject obj = val.toObject();
+                    QString id = obj["id"].toString();
+                    if (seenIds.contains(id)) continue;
+                    QVariantMap msg;
+                    msg["id"]      = id;
+                    msg["data"]    = obj["data"].toString();
+                    msg["channel"] = channelId;
+                    msg["isOwn"]   = (channelId == m_ownChannelId);
+                    msg["timestamp"] = QString();
+                    msg["pending"] = false;
+                    msg["failed"]  = false;
+                    QVariantMap parsed = parseMessagePayload(msg["data"].toString());
+                    msg["displayText"] = parsed["text"];
+                    msg["media"]       = parsed["media"];
+                    prepend.append(msg);
+                    seenIds.insert(id);
+                }
+                if (!prepend.isEmpty()) {
+                    existing = prepend + existing;
+                    saveCacheForChannel(channelId);
+                    emitMessagesChanged(channelId);
+                }
+            }
+
+            if (done) {
+                m_backfillCancelled.remove(channelId);
+                m_backfillSlots.remove(channelId);
+                emitStateChanged();
+                setStatus("Backfill complete for " + channelDisplayName(channelId));
+                return;
+            }
+
+            QJsonDocument cursorDoc(root["cursor"].toObject());
+            QString nextCursor = QString::fromUtf8(cursorDoc.toJson(QJsonDocument::Compact));
+
+            QTimer::singleShot(200, this, [this, channelId, nextCursor, cancelled]() {
+                stepBackfill(channelId, nextCursor, cancelled);
+            });
+        });
+}
+
+// ── Polling ──────────────────────────────────────────────────────────────────
+
+void YoloBoardModule::pollNextChannel() {
+    if (m_channelIds.isEmpty()) return;
+    if (m_pollIndex >= m_channelIds.size()) m_pollIndex = 0;
+    QString ch = m_channelIds.at(m_pollIndex);
+    m_pollIndex++;
+    fetchMessages(ch);
+}
+
+void YoloBoardModule::fetchMessages(const QString& channelId) {
+    if (m_fetchingChannels.contains(channelId)) return;
+    m_fetchingChannels.insert(channelId);
+
+    // zoneCall is thread-bound to main thread — already on main thread here
+    // since this is called from poll timer. Just run sync.
+    QString json = zoneCall("query_channel", {channelId, kQueryLimit}).toString();
+    m_fetchingChannels.remove(channelId);
+    // Diag: helps spot cross-channel subscriptions where the sequencer
+    // returns an empty set (it only tracks channels it's actively following —
+    // a fresh subscribe may need a backfill kick to populate state).
+    ybmDiag(QStringLiteral("query_channel channel=%1 bytes=%2")
+                .arg(channelDisplayName(channelId)).arg(json.size()));
+    if (json.isEmpty() || json == "[]") return;
+
+    QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
+    if (!doc.isArray()) return;
+
+    QVariantList& existing = m_allMessages[channelId];
+    QSet<QString> seenIds;
+    for (const QVariant& v : existing)
+        seenIds.insert(v.toMap().value("id").toString());
+
+    bool added = false;
+    for (const QJsonValue& val : doc.array()) {
+        QJsonObject obj = val.toObject();
+        QString id = obj["id"].toString();
+        if (seenIds.contains(id)) continue;
+
+        QString text = obj["data"].toString();
+
+        bool confirmed = false;
+        for (int i = 0; i < existing.size(); ++i) {
+            QVariantMap m = existing[i].toMap();
+            if ((m.value("pending").toBool() || m.value("failed").toBool())
+                && m.value("data").toString() == text) {
+                m["pending"] = false;
+                m["failed"]  = false;
+                m["id"]      = id;
+                existing[i]  = m;
+                confirmed = true;
+                break;
+            }
+        }
+
+        if (!confirmed) {
+            QVariantMap msg;
+            msg["id"]        = id;
+            msg["data"]      = text;
+            msg["channel"]   = channelId;
+            msg["isOwn"]     = (channelId == m_ownChannelId);
+            msg["timestamp"] = QDateTime::currentDateTime().toString("HH:mm:ss");
+            msg["pending"]   = false;
+            msg["failed"]    = false;
+            QVariantMap parsed = parseMessagePayload(text);
+            msg["displayText"] = parsed["text"];
+            msg["media"]       = parsed["media"];
+            existing.append(msg);
+            if (channelId != m_ownChannelId)
+                m_unreadCounts[channelId] = m_unreadCounts.value(channelId, 0) + 1;
+        }
+        seenIds.insert(id);
+        added = true;
+    }
+
+    if (added) {
+        saveCacheForChannel(channelId);
+        emitMessagesChanged(channelId);
+        emitChannelsChanged();
+    }
+}
+
+// ── Events ───────────────────────────────────────────────────────────────────
+
+void YoloBoardModule::emitStateChanged() {
+    emit eventResponse("stateChanged", {get_state()});
+}
+
+void YoloBoardModule::emitMessagesChanged(const QString& channelId) {
+    emit eventResponse("messagesChanged", {channelId});
+}
+
+void YoloBoardModule::emitChannelsChanged() {
+    emit eventResponse("channelsChanged", {get_channels()});
+}
+
+void YoloBoardModule::emitStatusChanged() {
+    emit eventResponse("statusChanged", {m_status});
+}
+
+void YoloBoardModule::emitMediaReady(const QString& cid, const QString& path) {
+    emit eventResponse("mediaReady", {cid, path});
+}
+
+void YoloBoardModule::emitThreadMessagesChanged(const QString& threadTopic) {
+    // Payload is the topic only; QML fetches get_thread_messages(topic) to
+    // pull the current buffer. Keeps the signal small even for long buffers.
+    emit eventResponse("threadMessagesChanged", {threadTopic});
+}
+
+// ── Config persistence ──────────────────────────────────────────────────────
+
+QString YoloBoardModule::load_saved_config() {
+    QFile f(uiConfigPath());
+    if (!f.open(QIODevice::ReadOnly)) return QStringLiteral("{}");
+    return QString::fromUtf8(f.readAll());
+}
+
+// ── Storage peer connect ────────────────────────────────────────────────────
+
+QString YoloBoardModule::connect_storage_peer(const QString& peerId,
+                                              const QString& addressesCsv) {
+    if (!m_storageReady) return QStringLiteral("Error: storage not ready");
+    QString pid = peerId.trimmed();
+    if (pid.isEmpty()) return QStringLiteral("Error: peer id required");
+
+    QStringList addrs;
+    for (const QString& a : addressesCsv.split(',', Qt::SkipEmptyParts)) {
+        QString t = a.trimmed();
+        if (!t.isEmpty()) addrs.append(t);
+    }
+
+    if (!logosAPI) return QStringLiteral("Error: no logos api");
+    qInfo() << "connect_storage_peer" << pid << addrs;
+    // Bypass the typed wrapper for this call: StorageModule::connect's
+    // template-variadic invokeRemoteMethod wraps the QStringList with
+    // QVariant::fromValue(QStringList), which does NOT deserialize to
+    // QList<QString> on the remote replica and causes the call to hang
+    // until the 20 s QRO timeout (this is the same QStringList-serialization
+    // bug we patched earlier). Passing a QVariantList of QString works.
+    LogosAPIClient* sc = logosAPI->getClient(kStorageModuleName);
+    ybmDiag(QStringLiteral("connect_storage_peer %1 addrs=%2").arg(pid).arg(addrs.join(',')));
+    // Pass the QStringList directly (wrapped once); server side takes
+    // QList<QString>& which matches QMetaType::QStringList.
+    sc->invokeRemoteMethod(kStorageModuleName, "connect",
+                           QVariantList{ QVariant(pid), QVariant::fromValue(addrs) });
+    setStatus(QStringLiteral("connect %1: accepted")
+                  .arg(pid.left(12) + QStringLiteral("\u2026")));
+
+    // Persist so we auto-dial on next start.
+    m_savedPeerId = pid;
+    m_savedPeerAddrs = addressesCsv.trimmed();
+    m_savedPeerDialed = true;
+    {
+        QFile f(uiConfigPath());
+        QJsonObject cfg;
+        if (f.open(QIODevice::ReadOnly)) {
+            cfg = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+        }
+        cfg["dataDir"] = m_dataDir;
+        cfg["nodeUrl"] = m_nodeUrl;
+        cfg["peerId"] = m_savedPeerId;
+        cfg["peerAddrs"] = m_savedPeerAddrs;
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            f.write(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
+    }
+    emitStateChanged();
+    return QStringLiteral("accepted");
+}
