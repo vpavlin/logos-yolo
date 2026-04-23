@@ -54,8 +54,10 @@
           ];
 
           circuits = builtins.fetchTarball {
-            url = "https://github.com/logos-blockchain/logos-blockchain/releases/download/0.2.1/logos-blockchain-circuits-v0.4.1-linux-x86_64.tar.gz";
-            sha256 = "1xnhl4y2zpxvcgm0xx95v0v6av2amp5isfi0s92cxrjg7dqmp5z8";
+            # Was 0.2.1/v0.4.1 — that release asset is gone from GitHub.
+            # Updated to the current shipped circuits release (0.1.2/v0.4.2).
+            url = "https://github.com/logos-blockchain/logos-blockchain/releases/download/0.1.2/logos-blockchain-circuits-v0.4.2-linux-x86_64.tar.gz";
+            sha256 = "0ad5b8czj36zfi01ibvnj7cy0fag14v87pd0bjwnwncbyarq8dcf";
           };
 
           rustLib = pkgsRust.rustPlatform.buildRustPackage {

@@ -68,6 +68,12 @@ logos-scaffold basecamp launch bob   --no-clean &
 - Thread message persistence: close + reopen the panel (or restart the app) and history is preserved
 - "My Threads" list of threads you've participated in
 
+## CI status
+
+Build workflows live in `.github/workflows/{build,release}.yml`. On push to `master` they matrix-build `module/#lgx` and `ui/#lgx` via `nix build`; on tag push matching `v*` they additionally attach both artifacts to a GitHub release.
+
+The `module/` build currently **fails on clean CI runners** because `logos-storage-module`'s transitive dep `logos-storage-nim` has a NAR hash mismatch on a submodule-bearing git input — upstream issue, not reproducible from our flake.lock alone. Local builds succeed because the nix store already contains a cached derivation. Unblock when upstream fixes the lockfile or publishes a binary cache. The `ui/` build runs green.
+
 ## Known sharp edges
 
 - `set_node_url` on zone-sequencer takes ~20 s cold-start even after our init reorder (zone-sequencer-side QRO source registration — file upstream).
